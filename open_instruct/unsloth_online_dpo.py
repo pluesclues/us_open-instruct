@@ -38,7 +38,7 @@ from open_instruct.dataset_processor import (
 )
 from open_instruct.model_utils import (
     ModelConfig,
-    batch_generation,
+    unsloth_batch_generation,
     disable_dropout_in_model,
     exact_div,
     first_true_indices,
@@ -57,6 +57,8 @@ from open_instruct.utils import (
     get_wandb_tags,
     maybe_use_ai2_wandb_entity,
 )
+import bitsandbytes as bnb
+from unsloth import FastLanguageModel
 
 api = HfApi()
 INVALID_LOGPROB = 1.0
@@ -245,6 +247,56 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
 
+    #Create the models
+    max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
+    dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+    load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
+
+    #creating unsloth FastLanguageModel and turning them into peft models
+    policy, _ = FastLanguageModel.from_pretrained(
+      model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+      max_seq_length = max_seq_length,
+      dtype = dtype,
+      load_in_4bit = load_in_4bit,
+    )
+
+    policy = FastLanguageModel.get_peft_model(
+        policy,
+        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16,
+        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+        bias = "none",    # Supports any, but = "none" is optimized
+        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+        random_state = 3407,
+        use_rslora = False,  # We support rank stabilized LoRA
+        loftq_config = None, # And LoftQ
+    )
+
+    ref_policy, tokenizer = FastLanguageModel.from_pretrained(
+      model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+      max_seq_length = max_seq_length,
+      dtype = dtype,
+      load_in_4bit = load_in_4bit,
+    )
+
+    ref_policy = FastLanguageModel.get_peft_model(
+        ref_policy,
+        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16,
+        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+        bias = "none",    # Supports any, but = "none" is optimized
+        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+        random_state = 3407,
+        use_rslora = False,  # We support rank stabilized LoRA
+        loftq_config = None, # And LoftQ
+    )
+
     # create a tokenizer (pad from right)
     tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, padding_side="right")
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # NOTE: we do not resize the embedding
@@ -271,19 +323,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             )
             wandb.log({"token_length": wandb.Image(f"runs/{args.run_name}/token_length.png")})
 
-    # create the model and optimizer
-    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        model_config.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        use_cache=False,
-    )
-    ref_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        model_config.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        use_cache=False,
-    )
+    # create the reward model and optimizer
     reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
         args.reward_model_path,
         num_labels=1,
@@ -301,7 +341,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             args.stop_token_id = tokenizer.eos_token_id
         if args.stop_token == "period":
             args.stop_token_id = tokenizer.encode(".")[0]
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, eps=args.eps)
+    optimizer = bnb.optim.Adam(policy.parameters(), lr=args.learning_rate, betas=(0.9, 0.995), optim_bits=8, percentile_clipping=5,eps=args.eps)
     scheduler = get_scheduler(
         args.lr_scheduler_type,
         optimizer=optimizer,
@@ -407,20 +447,24 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             scores = []
             sequence_lengths = []
             with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
-                query_responses, logitss = batch_generation(
+                query_responses, logitss = unsloth_batch_generation(
                     unwrapped_model,
                     queries,
                     args.local_rollout_forward_batch_size,
                     tokenizer.pad_token_id,
                     generation_config,
                 )
-
+            FastLanguageModel.for_training(model)
+            FastLanguageModel.for_training(ref_policy)
             training_time_start = time.time()
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
                 response = query_response[:, context_length:]
-                logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                #logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                model_output = forward(model, query_response, tokenizer.pad_token_id)
+                logits = model_output.logits[:, context_length - 1 : -1]
+                logitss[i : i + args.local_rollout_forward_batch_size] = logits
                 logits /= args.temperature + 1e-7
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
@@ -570,9 +614,10 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                             losses = (logits - 1 / (2 * args.beta)) ** 2
                         else:
                             raise NotImplementedError(f"invalid loss type {args.loss_type}")
-
-                        loss = losses.mean()
-                        accelerator.backward(loss)
+                        
+                        with torch.cuda.amp.autocast(dtype = torch.float16):
+                            loss = losses.mean()
+                            accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
                         with torch.no_grad():
