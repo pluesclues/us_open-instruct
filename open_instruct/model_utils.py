@@ -316,6 +316,30 @@ def batch_generation(
         logitss.append(logits)
     return torch.cat(query_responses, 0), torch.cat(logitss, 0)
 
+@torch.no_grad()
+def unsloth_batch_generation(
+    model: torch.nn.Module,
+    queries: torch.Tensor,
+    local_rollout_forward_batch_size: int,
+    pad_token_id: int,
+    generation_config: dict,
+):
+    query_responses = []
+    logitss = []
+    from unsloth import FastLanguageModel
+    FastLanguageModel.for_inference(model)
+    for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
+        query = queries[i : i + local_rollout_forward_batch_size]
+        query_response, logits = generate(
+            model,
+            query,
+            pad_token_id,
+            generation_config,
+        )
+        query_responses.append(query_response)
+        logitss.append(logits)
+    FastLanguageModel.for_training(model)
+    return torch.cat(query_responses, 0), torch.cat(logitss, 0)
 
 def save_with_accelerate(
     accelerator: Accelerator,
