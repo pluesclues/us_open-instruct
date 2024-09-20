@@ -316,6 +316,46 @@ def batch_generation(
         logitss.append(logits)
     return torch.cat(query_responses, 0), torch.cat(logitss, 0)
 
+def batch_generation_vllm(
+    llm: "LLM",
+    generation_config: "SamplingParams",
+    accelerator: Accelerator,
+    queries: torch.Tensor,
+    unwrapped_model: torch.nn.Module,
+    g_vllm_responses: torch.Tensor,
+    pad_token_id: int,
+    response_length: int,
+    device: torch.device,
+):
+    g_queries_list = gather_object(queries.tolist())
+    if accelerator.is_main_process:
+        llmp = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        start_time = time.time()
+        llmp.load_weights(unwrapped_model.named_parameters())
+        print(f"🔥 Loading weights using shared memory: takes {time.time() - start_time:.2f} seconds")
+        g_queries_list = [
+            [inneritem for inneritem in item if inneritem != pad_token_id] for item in g_queries_list
+        ]
+        generation_start_time = time.time()
+        outputs = llm.generate(prompt_token_ids=g_queries_list, sampling_params=generation_config)
+        padded_response_token_ids = []
+        for output in outputs:
+            token_ids = list(output.outputs[0].token_ids)
+            DUMMY_PAD_TOKEN = 0  # we can't use tokenizer.pad_token_id because it's outside vocab and `torch.gather(all_logprob, 2, response.unsqueeze(-1))` will error out
+            padded_token_ids = token_ids + [DUMMY_PAD_TOKEN] * (response_length - len(token_ids))
+            padded_response_token_ids.append(padded_token_ids)
+        print(f"🔥🔥🔥 Generation time: {time.time() - generation_start_time:.2f} seconds")
+        padded_response_token_ids = torch.tensor(padded_response_token_ids, device=device)
+        g_vllm_responses[:] = padded_response_token_ids
+
+    broadcast(g_vllm_responses, 0)
+
+    return g_vllm_responses[
+        accelerator.local_process_index * queries.shape[0] : (accelerator.local_process_index + 1)
+        * queries.shape[0]
+    ]
+
+
 @torch.no_grad()
 def unsloth_batch_generation(
     model: torch.nn.Module,
