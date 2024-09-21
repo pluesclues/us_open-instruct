@@ -56,8 +56,8 @@ class ModelConfig:
     you must install this manually by running `pip install flash-attn --no-build-isolation`"""
     use_cache: Optional[bool] = None
     """Whether to use cache in the model."""
-    gradient_checkpointing: bool = False
-    """Whether to use gradient checkpointing in the model."""
+    #gradient_checkpointing: bool = False
+    #"""Whether to use gradient checkpointing in the model."""
 
     # PEFT-related args
     use_peft: bool = False
