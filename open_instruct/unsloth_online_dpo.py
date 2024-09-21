@@ -27,7 +27,6 @@ from transformers import (
     PreTrainedModel,
     get_scheduler,
 )
-
 import sys
 #Added because of google collab path environments are not working as intended
 sys.path.append("/content/us_open-instruct/")
@@ -262,6 +261,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
       max_seq_length = max_seq_length,
       dtype = dtype,
       load_in_4bit = load_in_4bit,
+      #token  = "" 
     )
 
     policy = FastLanguageModel.get_peft_model(
@@ -284,9 +284,11 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
       max_seq_length = max_seq_length,
       dtype = dtype,
       load_in_4bit = load_in_4bit,
+      #token = "" 
+
     )
 
-    ref_policy = FastLanguageModel.get_peft_model(
+    ref_model = FastLanguageModel.get_peft_model(
         ref_policy,
         r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
@@ -307,7 +309,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     tokenizer.chat_template = CHAT_TEMPLATES[dataset_config.chat_template]
 
     # create the dataset
-    dataset = load_dataset(dataset_config.dataset_name)
+    dataset = load_dataset("trl-internal-testing/sentiment-trl-style")
     dataset_processor = SFTDatasetProcessor(tokenizer=tokenizer, config=dataset_config)
     dataset_processor.sanity_check_(dataset)
     with accelerator.main_process_first():
@@ -332,7 +334,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         args.reward_model_path,
         num_labels=1,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        #attn_implementation="flash_attention_2",
         use_cache=False,
     )
     model = policy
@@ -701,5 +703,15 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
 
 
 if __name__ == "__main__":
+
+    # print("Before deletion:")
+    # print("Args, ", dir(Args))  # List all attributes
+    # if hasattr(Args, 'gradient_checkpointing'):
+    #     print("Deleting Args.gradient_checkpointing")
+    #     del Args.gradient_checkpointing
+    # print("After deletion:")
+    # print("Args, ", dir(Args))  # Check if it was deleted
+    ModelConfig.gradient_checkpointing = True
     parser = ArgumentParserPlus((Args, DatasetConfig, ModelConfig))
+
     main(*parser.parse())
