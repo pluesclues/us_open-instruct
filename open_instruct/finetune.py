@@ -962,7 +962,8 @@ def main(args: FlatArguments):
                     loss = loss_fct(shift_logits, shift_labels)
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
-                accelerator.backward(loss)
+                with torch.cuda.amp.autocast(dtype = torch.float16):
+                    accelerator.backward(loss)
                 # clip gradient norm. don't do this with deepspeed
                 if accelerator.sync_gradients and args.clip_grad_norm > 0:
                     accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
