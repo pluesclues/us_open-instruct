@@ -493,7 +493,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 # Response Processing 2. run reward model on the truncated responses
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
 
-                print("postprocessed_query_response: ", tokenizer.decode(postprocessed_query_response))
+                #print("postprocessed_query_response: ", tokenizer.decode(postprocessed_query_response))
                 
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 _, score, _ = get_reward(
