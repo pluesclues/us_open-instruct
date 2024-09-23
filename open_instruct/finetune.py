@@ -577,11 +577,11 @@ def main(args: FlatArguments):
         load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
 
         policy, tokenizer = FastLanguageModel.from_pretrained(
-        model_name =  args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
-        max_seq_length = max_seq_length,
-        dtype = dtype,
-        load_in_4bit = load_in_4bit,
-        )
+            model_name =  args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+            max_seq_length = max_seq_length,
+            dtype = dtype,
+            load_in_4bit = load_in_4bit,
+            )
     else: 
         if args.tokenizer_name:
             tokenizer = AutoTokenizer.from_pretrained(
