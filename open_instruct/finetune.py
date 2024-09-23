@@ -235,6 +235,10 @@ class FlatArguments:
         default=False,
         metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."},
     )
+    use_unsloth: bool = field(
+        default=True,
+        metadata={"help": "Unsloth finetuning"},
+    )
     warmup_ratio: float = field(
         default=0.03,
         metadata={"help": "Linear warmup over warmup_ratio fraction of total steps."},
@@ -566,66 +570,78 @@ def main(args: FlatArguments):
         warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
                    from the model revision `{args.model_revision}`."""
         logger.warn(warning)
+    if use_unsloth:
+        
+        max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
+        dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+        load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
 
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer_name,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision,
-            token=os.getenv("HF_TOKEN", None),
+        policy, tokenizer = FastLanguageModel.from_pretrained(
+        model_name =  args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+        max_seq_length = max_seq_length,
+        dtype = dtype,
+        load_in_4bit = load_in_4bit,
         )
-    elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name_or_path,
-            trust_remote_code=args.trust_remote_code,
-            use_fast=not args.use_slow_tokenizer,
-            revision=tokenizer_revision,
-            token=os.getenv("HF_TOKEN", None),
-        )
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-
-    if args.model_name_or_path:
-        if args.use_qlora:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-            device_index = accelerator.local_process_index
-            device_map = {"": device_index}  # force data-parallel training.
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                quantization_config=bnb_config,
-                device_map=device_map,
+    else: 
+        if args.tokenizer_name:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.tokenizer_name,
                 trust_remote_code=args.trust_remote_code,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
-                revision=args.model_revision,
+                use_fast=not args.use_slow_tokenizer,
+                revision=tokenizer_revision,
+                token=os.getenv("HF_TOKEN", None),
+            )
+        elif args.model_name_or_path:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                use_fast=not args.use_slow_tokenizer,
+                revision=tokenizer_revision,
                 token=os.getenv("HF_TOKEN", None),
             )
         else:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-                trust_remote_code=args.trust_remote_code,
-                low_cpu_mem_usage=args.low_cpu_mem_usage,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
-                revision=args.model_revision,
-                token=os.getenv("HF_TOKEN", None),
+            raise ValueError(
+                "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+                "You can do it from another script, save it, and load it from here, using --tokenizer_name."
             )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForCausalLM.from_config(config)
+
+        if args.model_name_or_path:
+            if args.use_qlora:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                device_index = accelerator.local_process_index
+                device_map = {"": device_index}  # force data-parallel training.
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    trust_remote_code=args.trust_remote_code,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
+                    revision=args.model_revision,
+                    token=os.getenv("HF_TOKEN", None),
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    trust_remote_code=args.trust_remote_code,
+                    low_cpu_mem_usage=args.low_cpu_mem_usage,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
+                    revision=args.model_revision,
+                    token=os.getenv("HF_TOKEN", None),
+                )
+        else:
+            logger.info("Training new model from scratch")
+            model = AutoModelForCausalLM.from_config(config)
 
     # no default pad token for llama!
     # here we add all special tokens again, because the default ones are not in the special_tokens_map
@@ -696,24 +712,38 @@ def main(args: FlatArguments):
     if args.add_bos:
         # also add bos in the chat template
         tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
-
-    if args.use_lora:
-        if args.use_qlora:
-            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
+    if not use_unsloth: 
+        if args.use_lora:
+            if args.use_qlora:
+                model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+            logger.info("Initializing LORA model...")
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
+            )
+            model = get_peft_model(model, peft_config)
+            model.print_trainable_parameters()
+        elif args.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+    else: 
+        mdoel = FastLanguageModel.get_peft_model(
+            model,
+            r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj",],
+            lora_alpha = 16,
+            lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+            bias = "none",    # Supports any, but = "none" is optimized
+            # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+            use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+            random_state = 3407,
+            use_rslora = False,  # We support rank stabilized LoRA
+            loftq_config = None, # And LoftQ
         )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
 
     # Preprocessing the datasets.
     if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
