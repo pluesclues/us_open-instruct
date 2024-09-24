@@ -236,6 +236,10 @@ class FlatArguments:
         default=False,
         metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."},
     )
+    use_unsloth: bool = field(
+        default=True,
+        metadata={"help": "Unsloth finetuning"},
+    )
     warmup_ratio: float = field(
         default=0.03,
         metadata={"help": "Linear warmup over warmup_ratio fraction of total steps."},
@@ -961,7 +965,8 @@ def main(args: FlatArguments):
                         loss += aux_loss
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
-                accelerator.backward(loss)
+                with torch.cuda.amp.autocast(dtype = torch.float16):
+                    accelerator.backward(loss)
                 if args.load_balancing_loss:
                     total_aux_loss += aux_loss.detach().float()
                 # clip gradient norm. don't do this with deepspeed
