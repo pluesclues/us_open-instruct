@@ -1,90 +1,334 @@
-import gc
+# !/usr/bin/env python
+# coding=utf-8
+# Copyright 2024 AllenAI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+import math
 import os
 import random
+import subprocess
 import time
-from dataclasses import asdict, dataclass
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from datetime import timedelta
+from functools import partial
+from typing import List, Optional, Union
 
-import numpy as np
-import pandas as pd
+import datasets
+import deepspeed
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.utils
-import torch.utils.data
+import transformers
 from accelerate import Accelerator
-from accelerate.utils import broadcast, gather_object
+from accelerate.logging import get_logger
+from accelerate.utils import InitProcessGroupKwargs, set_seed
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from rich.pretty import pprint
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from tqdm.auto import tqdm
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
-    AutoModelForSequenceClassification,
     AutoTokenizer,
-    GenerationConfig,
-    PreTrainedModel,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    GPT2Tokenizer,
+    GPTNeoXTokenizerFast,
+    LlamaTokenizer,
+    LlamaTokenizerFast,
+    OPTForCausalLM,
     get_scheduler,
 )
-import sys
-#Added because of google collab path environments are not working as intended
-sys.path.append("/content/us_open-instruct/")
 
-from open_instruct.dataset_processor import (
-    CHAT_TEMPLATES,
-    INPUT_IDS_PROMPT_KEY,
-    DatasetConfig,
-    SFTDatasetProcessor,
-    SimpleGenerateCollator,
-    visualize_token,
-)
-from open_instruct.model_utils import (
-    ModelConfig,
-    unsloth_batch_generation,
-    disable_dropout_in_model,
-    exact_div,
-    first_true_indices,
-    forward,
-    get_reward,
-    prepare_deepspeed,
-    print_rich_single_line_metrics,
-    print_rich_table,
-    save_with_accelerate,
-    truncate_response,
-    unwrap_model_for_generation,
-)
-from open_instruct.online_eval import evaluate
+from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.utils import (
     ArgumentParserPlus,
+    clean_last_n_checkpoints,
+    get_datasets,
+    get_last_checkpoint_path,
     get_wandb_tags,
+    is_beaker_job,
+    maybe_get_beaker_config,
+    maybe_use_ai2_hf_entity,
     maybe_use_ai2_wandb_entity,
+    upload_metadata_to_hf,
 )
-import bitsandbytes as bnb
 from unsloth import FastLanguageModel
-
-api = HfApi()
-INVALID_LOGPROB = 1.0
+logger = get_logger(__name__)
 
 
 @dataclass
-class Args:
-    # common args
+class FlatArguments:
+    """
+    Full arguments class for all fine-tuning jobs.
+    """
+
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """The name of this experiment"""
-    seed: int = 1
-    """Seed of the experiment"""
-    run_name: Optional[str] = None
-    """A unique name of this run"""
-
-    # wandb and HF tracking configs
-    with_tracking: bool = False
-    """If toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "open_instruct_internal"
-    """The wandb's project name"""
-    wandb_entity: Optional[str] = None
-    """The entity (team) of wandb's project"""
-    push_to_hub: bool = False
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
+            )
+        },
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    tokenizer_revision: Optional[str] = field(
+        default=None,
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    use_flash_attn: bool = field(
+        default=True,
+        metadata={"help": "Whether to use flash attention in the model training"},
+    )
+    use_slow_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the slow tokenizer or not (which is then fast tokenizer)."},
+    )
+    model_revision: Optional[str] = field(
+        default=None,
+        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether or not to allow for custom models defined on the Hub in their own modeling files. "
+                "This option should only be set to `True` for repositories you trust and in which you "
+                "have read the code, as it will execute code present on the Hub on your local machine."
+            )
+        },
+    )
+    low_cpu_mem_usage: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "It is an option to create the model as an empty shell, "
+                "then only materialize its parameters when the pretrained weights are loaded. "
+                "set True will benefit LLM loading time and RAM consumption."
+            )
+        },
+    )
+    dataset_name: Optional[str] = field(
+        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    dataset_mixer: Optional[dict] = field(
+        default=None, metadata={"help": "A dictionary of datasets (local or HF) to sample from."}
+    )
+    dataset_mixer_list: Optional[list[str]] = field(
+        default=None, metadata={"help": "A list of datasets (local or HF) to sample from."}
+    )
+    dataset_mix_dir: Optional[str] = field(
+        default=None, metadata={"help": "The directory to save the mixed dataset to disk."}
+    )
+    dataset_config_name: Optional[str] = field(
+        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "The input training data file (a json/jsonl file)."}
+    )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "For debugging purposes or quicker training, truncate the number of training examples to this "
+                "value if set."
+            )
+        },
+    )
+    preprocessing_num_workers: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of processes to use for the preprocessing."},
+    )
+    max_seq_length: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The maximum total input sequence length after tokenization. "
+                "Sequences longer than this will be truncated,"
+            )
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+    )
+    add_bos: bool = field(
+        default=False,
+        metadata={
+            "help": "Forcibly add bos token to the beginning of the input sequence."
+            " Use only when tokenizer does not add bos token by default."
+        },
+    )
+    clip_grad_norm: float = field(
+        default=-1,
+        metadata={"help": "Clip gradient norm. Not compatible with deepspeed (use deepspeed config instead)."},
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={"help": "Number of updates steps to accumulate before performing a backward/update pass."},
+    )
+    learning_rate: float = field(
+        default=2e-5,
+        metadata={"help": "The initial learning rate for AdamW optimizer."},
+    )
+    logging_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Log the training loss and learning rate every logging_steps steps."},
+    )
+    lora_rank: int = field(
+        default=64,
+        metadata={"help": "The rank of lora."},
+    )
+    lora_alpha: float = field(
+        default=16,
+        metadata={"help": "The alpha parameter of lora."},
+    )
+    lora_dropout: float = field(
+        default=0.1,
+        metadata={"help": "The dropout rate of lora modules."},
+    )
+    lr_scheduler_type: str = field(
+        default="linear",
+        metadata={
+            "help": "The scheduler type to use for learning rate adjustment.",
+            "choices": ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+        },
+    )
+    num_train_epochs: int = field(
+        default=2,
+        metadata={"help": "Total number of training epochs to perform."},
+    )
+    output_dir: str = field(
+        default="output/",
+        metadata={"help": "The output directory where the model predictions and checkpoints will be written."},
+    )
+    per_device_train_batch_size: int = field(
+        default=8,
+        metadata={"help": "Batch size per GPU/TPU core/CPU for training."},
+    )
+    use_lora: bool = field(
+        default=False,
+        metadata={"help": "If True, will use LORA (low-rank parameter-efficient training) to train the model."},
+    )
+    use_qlora: bool = field(
+        default=False,
+        metadata={"help": "Use qLoRA training - initializes model in quantized form. Not compatible with deepspeed."},
+    )
+    use_8bit_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Use 8bit optimizer from bitsandbytes. Not compatible with deepspeed."},
+    )
+    use_unsloth: bool = field(
+        default=True,
+        metadata={"help": "Unsloth finetuning"},
+    )
+    warmup_ratio: float = field(
+        default=0.03,
+        metadata={"help": "Linear warmup over warmup_ratio fraction of total steps."},
+    )
+    weight_decay: float = field(
+        default=0.0,
+        metadata={"help": "Weight decay for AdamW if we apply some."},
+    )
+    timeout: int = field(
+        default=1800,
+        metadata={
+            "help": "Timeout for the training process in seconds."
+            "Useful if tokenization process is long. Default is 1800 seconds (30 minutes)."
+        },
+    )
+    reduce_loss: str = field(
+        default="mean",
+        metadata={
+            "help": "How to reduce loss over tokens. Options are 'mean' or 'sum'."
+            "Using 'sum' can improve chat model performance."
+        },
+    )
+    wandb_entity: Optional[str] = field(
+        default=None,
+        metadata={"help": "Entity to use for logging to wandb."},
+    )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "If the training should continue from a checkpoint folder."},
+    )
+    with_tracking: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable experiment trackers for logging."},
+    )
+    report_to: Union[str, List[str]] = field(
+        default="all",
+        metadata={
+            "help": "The integration(s) to report results and logs to. "
+            "Can be a single string or a list of strings. "
+            "Options are 'tensorboard', 'wandb', 'comet_ml', 'clearml', or 'all'. "
+            "Specify multiple by listing them: e.g., ['tensorboard', 'wandb']"
+        },
+    )
+    save_to_hub: Optional[str] = field(
+        default=None,
+        metadata={"help": "Save the model to the Hub under this name. E.g allenai/your-model"},
+    )
+    gradient_checkpointing: bool = field(
+        default=False,
+        metadata={"help": "Turn on gradient checkpointing. Saves memory but slows training."},
+    )
+    max_train_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, overrides the number of training steps. Otherwise, num_train_epochs is used."},
+    )
+    seed: int = field(default=42, metadata={"help": "Random seed for initialization and dataset shuffling."})
+    checkpointing_steps: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch."  # noqa
+        },
+    )
+    overwrite_output_dir: bool = field(
+        default=False,
+        metadata={
+            "help": "Overwrite the content of the output directory. Means that resumption will always start from scratch."
+        },
+    )
+    keep_last_n_checkpoints: int = field(
+        default=3,
+        metadata={"help": "How many checkpoints to keep in the output directory. -1 for all."},
+    )
+    fused_optimizer: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to use fused AdamW or not.",
+        },
+    )
+    load_balancing_loss: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to include a load balancing loss (for OLMoE) or not.",
+        },
+    )
+    load_balancing_weight: float = field(
+        default=0.5,
+        metadata={"help": "Weight for load balancing loss if applicable."},
+    )
+    push_to_hub: bool = True
     """Whether to upload the saved model to huggingface"""
     hf_entity: Optional[str] = None
     """The user or org name of the model repository from the Hugging Face Hub"""
@@ -94,627 +338,792 @@ class Args:
     """The revision of the saved model in the Hugging Face Hub (can be autoset if not given)"""
     hf_repo_url: Optional[str] = None
     """The url of the saved model in the Hugging Face Hub (will be autoset)"""
-    output_dir: Optional[str] = None
-    """Where to save the model"""
+    try_launch_beaker_eval_jobs: bool = True
+    """Whether to launch beaker evaluation jobs after training"""
+    hf_metadata_dataset: Optional[str] = "allenai/tulu-3-evals"
+    """What dataset to upload the metadata to. If unset, don't upload metadata"""
 
-    # optimizer args
-    eps: float = 1e-5
-    """The epsilon value for the optimizer"""
-    learning_rate: float = 2e-5
-    """The initial learning rate for AdamW optimizer."""
-    lr_scheduler_type: Literal[
-        "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"
-    ] = "linear"
-    """Which scheduler to use"""
-    warm_up_steps: int = 0
-    """Number of warm up steps for the scheduler"""
-    gradient_checkpointing: bool = True
-    """Whether to use gradient checkpointing"""
+    def __post_init__(self):
+        if self.reduce_loss not in ["mean", "sum"]:
+            raise ValueError("reduce_loss must be either 'mean' or 'sum'")
+        if (
+            self.dataset_name is None
+            and self.train_file is None
+            and self.dataset_mixer is None
+            and self.dataset_mixer_list is None
+        ):
+            raise ValueError("Need either a dataset name, dataset mixer, or a training file.")
+        else:
+            if self.train_file is not None:
+                extension = self.train_file.split(".")[-1]
+                assert extension in ["json", "jsonl"], "`train_file` should be a json or a jsonl file."
+        if (
+            (self.dataset_name is not None and (self.dataset_mixer is not None or self.dataset_mixer_list is not None))
+            or (self.dataset_name is not None and self.train_file is not None)
+            or (
+                (self.dataset_mixer is not None or self.dataset_mixer_list is not None) and self.train_file is not None
+            )
+            or (self.dataset_mixer is not None and self.dataset_mixer_list is not None)
+        ):
+            raise ValueError("Cannot provide two dataset selection mechanisms.")
 
-    # various batch sizes
-    num_train_epochs: int = 1
-    """Number of epochs to train"""
-    gradient_accumulation_steps: int = 8
-    """The number of gradient accumulation steps"""
-    per_device_train_batch_size: Optional[int] = 1
-    """The forward batch size per device (local_micro_batch_size)"""
-    per_device_eval_batch_size: Optional[int] = 1
-    """The forward batch size per device for evaluation (local_micro_batch_size)"""
-    total_episodes: Optional[int] = 100000
-    """The total number of episodes in the dataset"""
-    world_size: Optional[int] = None
-    """The number of processes (GPUs) to use"""
-    micro_batch_size: Optional[int] = None
-    """The micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`)"""
-    local_batch_size: Optional[int] = None
-    """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
-    batch_size: Optional[int] = None
-    """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
-    num_training_steps: Optional[int] = None
-    """The number of training_steps to train"""
-    num_evals: int = 4
-    """The number of evaluations to run throughout training"""
-    eval_freq: Optional[int] = None
-    """The frequency of evaluation steps"""
-    local_dataloader_batch_size: Optional[int] = None
-    """The batch size per GPU for the dataloader"""
-
-    # online settings
-    num_epochs: int = 4
-    """the number of epochs to train"""
-    num_mini_batches: int = 1
-    """Number of minibatches to split a batch into"""
-    local_mini_batch_size: Optional[int] = None
-    """the mini batch size per GPU"""
-    mini_batch_size: Optional[int] = None
-    """the mini batch size across GPUs"""
-    local_rollout_forward_batch_size: int = 64
-    """per rank no grad forward pass in the rollout phase"""
-    reward_model_path: str = "EleutherAI/pythia-160m"
-    """the path to the reward model"""
-
-    # generation config
-    response_length: int = 53
-    """the length of the response"""
-    stop_token: Optional[Literal["eos", "period"]] = None
-    """the stop token"""
-    stop_token_id: Optional[int] = None
-    """the truncation token id"""
-    min_response_length: int = 0
-    """stop only after this many tokens"""
-    temperature: float = 0.7
-    """the sampling temperature"""
-    penalty_reward_value: float = -1.0
-    """the reward value for responses that do not contain `stop_token_id`"""
-    non_stop_penalty: bool = False
-    """whether to penalize responses that do not contain `stop_token_id`"""
-
-    # online DPO specific args
-    beta: float = 0.05
-    """the beta value of the RLHF objective (KL coefficient)"""
-    num_generation_per_prompt: int = 2
-    """the number of generations per prompt (currently only support 2)"""
-    loss_type: Literal["sigmoid", "ipo"] = "sigmoid"
-    """the loss type for the DPO algorithm"""
+        if self.try_launch_beaker_eval_jobs and not self.push_to_hub:
+            raise ValueError("Cannot launch Beaker evaluation jobs without pushing to the Hub.")
 
 
-def calculate_runtime_args_and_accelerator(args: Args, model_config: ModelConfig) -> Accelerator:
-    """calculate (in-place) runtime args such as the effective batch size, word size, etc."""
-    # set up accelerator and a unique run name with timestamp
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-    time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
-    time_int = broadcast(time_tensor, 0).item()
-    args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
+def encode_with_prompt_completion_format(example, tokenizer, max_seq_length, add_bos=False):
+    """
+    Here we assume each example has 'prompt' and 'completion' fields.
+    We concatenate prompt and completion and tokenize them together because otherwise prompt will be padded/trancated
+    and it doesn't make sense to follow directly with the completion.
+    """
+    # if prompt doesn't end with space and completion doesn't start with space, add space
+    if not example["prompt"].endswith((" ", "\n", "\t")) and not example["completion"].startswith((" ", "\n", "\t")):
+        example_text = example["prompt"] + " " + example["completion"]
+    else:
+        example_text = example["prompt"] + example["completion"]
+    example_text = example_text + tokenizer.eos_token
+    if add_bos:
+        example_text = tokenizer.bos_token + example_text
+    tokenized_example = tokenizer(example_text, return_tensors="pt", max_length=max_seq_length, truncation=True)
+    input_ids = tokenized_example.input_ids
+    labels = input_ids.clone()
+    tokenized_prompt = tokenizer(example["prompt"], return_tensors="pt", max_length=max_seq_length, truncation=True)
+    # mask the prompt part for avoiding loss
+    labels[:, : tokenized_prompt.input_ids.shape[1]] = -100
+    attention_mask = torch.ones_like(input_ids)
+    return {
+        "input_ids": input_ids.flatten(),
+        "labels": labels.flatten(),
+        "attention_mask": attention_mask.flatten(),
+    }
 
-    # calculate runtime config
-    args.world_size = accelerator.num_processes
-    args.local_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps * args.num_mini_batches
-    args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
-    args.batch_size = int(args.local_batch_size * args.world_size)
-    args.mini_batch_size = exact_div(
-        args.batch_size, args.num_mini_batches, "`batch_size` must be a multiple of `num_mini_batches`"
-    )
-    args.local_mini_batch_size = exact_div(
-        args.local_batch_size, args.num_mini_batches, "`local_batch_size` must be a multiple of `num_mini_batches`"
-    )
-    args.num_training_steps = args.total_episodes // args.batch_size
-    args.eval_freq = max(1, args.num_training_steps // args.num_evals)
-    # DPO logic: repeats the same prompt `num_generation_per_prompt` times
-    args.local_dataloader_batch_size = exact_div(
-        args.local_batch_size,
-        args.num_generation_per_prompt,
-        "`local_batch_size` must be a multiple of `num_generation_per_prompt`",
-    )
+
+def encode_with_messages_format(example, tokenizer, max_seq_length, add_bos=False):
+    """
+    Here we assume each example has a 'messages' field Each message is a dict with 'role' and 'content' fields.
+    We concatenate all messages with the roles as delimiters and tokenize them together.
+    """
+    messages = example["messages"]
+    if len(messages) == 0:
+        raise ValueError("messages field is empty.")
+
+    def _concat_messages(messages):
+        message_text = ""
+        for message in messages:
+            if message["role"] == "system":
+                message_text += "<|system|>\n" + message["content"].strip() + "\n"
+            elif message["role"] == "user":
+                message_text += "<|user|>\n" + message["content"].strip() + "\n"
+            elif message["role"] == "assistant":
+                message_text += "<|assistant|>\n" + message["content"].strip() + tokenizer.eos_token + "\n"
+            else:
+                raise ValueError("Invalid role: {}".format(message["role"]))
+        return message_text
+
+    example_text = _concat_messages(messages).strip()
+    if add_bos:
+        example_text = tokenizer.bos_token + example_text
+    tokenized_example = tokenizer(example_text, return_tensors="pt", max_length=max_seq_length, truncation=True)
+    input_ids = tokenized_example.input_ids
+    labels = input_ids.clone()
+
+    # mask the non-assistant part for avoiding loss
+    for message_idx, message in enumerate(messages):
+        if message["role"] != "assistant":
+            if message_idx == 0:
+                message_start_idx = 0
+            else:
+                message_start_idx = tokenizer(
+                    _concat_messages(messages[:message_idx]),
+                    return_tensors="pt",
+                    max_length=max_seq_length,
+                    truncation=True,
+                ).input_ids.shape[1]
+            if message_idx < len(messages) - 1 and messages[message_idx + 1]["role"] == "assistant":
+                # here we also ignore the role of the assistant
+                messages_so_far = _concat_messages(messages[: message_idx + 1]) + "<|assistant|>\n"
+            else:
+                messages_so_far = _concat_messages(messages[: message_idx + 1])
+            message_end_idx = tokenizer(
+                messages_so_far, return_tensors="pt", max_length=max_seq_length, truncation=True
+            ).input_ids.shape[1]
+            labels[:, message_start_idx:message_end_idx] = -100
+
+            if message_end_idx >= max_seq_length:
+                break
+
+    attention_mask = torch.ones_like(input_ids)
+    return {
+        "input_ids": input_ids.flatten(),
+        "labels": labels.flatten(),
+        "attention_mask": attention_mask.flatten(),
+    }
+
+
+def main(args: FlatArguments):
+    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
+    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
+    # in the environment
+    use_unsloth=  args.use_unsloth
+    print("use_unsloth is: ", use_unsloth)
     if args.push_to_hub:
         if args.hf_repo_id is None:  # auto-generate one
-            args.hf_repo_id = f"{args.exp_name}__{model_config.model_name_or_path.replace('/', '_')}"
-        if args.hf_entity is None:
-            args.hf_entity = api.whoami()["name"]
+            args.hf_repo_id = "open_instruct_dev"
+        if args.hf_entity is None:  # first try to use AI2 entity
+            args.hf_entity = maybe_use_ai2_hf_entity()
+        if args.hf_entity is None:  # then try to use the user's entity
+            args.hf_entity = HfApi().whoami()["name"]
         args.hf_repo_id = f"{args.hf_entity}/{args.hf_repo_id}"
         if args.hf_repo_revision is None:  # auto-generate one
-            args.hf_repo_revision = args.run_name
+            args.hf_repo_revision = (
+                f"{args.exp_name}__{args.model_name_or_path.replace('/', '_')}__{args.seed}__{int(time.time())}"
+            )
         args.hf_repo_url = f"https://huggingface.co/{args.hf_repo_id}/tree/{args.hf_repo_revision}"
 
+    accelerator_log_kwargs = {}
+
     if args.with_tracking:
+        accelerator_log_kwargs["log_with"] = args.report_to
+        accelerator_log_kwargs["project_dir"] = args.output_dir
+
+    # if you get timeouts (e.g. due to long tokenization) increase this.
+    timeout_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=args.timeout))
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        use_seedable_sampler=True,
+        **accelerator_log_kwargs,
+        kwargs_handlers=[timeout_kwargs],
+    )
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
+
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+    accelerator.wait_for_everyone()
+
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+        )
+    elif args.dataset_mixer is not None:
+        # mixing datasets via config
+        raw_datasets = get_datasets(
+            args.dataset_mixer,
+            configs=args.dataset_config_name,
+            splits=["train"],
+            save_data_dir=args.dataset_mix_dir if accelerator.is_main_process else None,
+            columns_to_keep=["messages"],
+        )
+    elif args.dataset_mixer_list is not None:
+        # mixing datasets via config
+        raw_datasets = get_datasets(
+            args.dataset_mixer_list,
+            configs=args.dataset_config_name,
+            splits=["train"],
+            save_data_dir=args.dataset_mix_dir if accelerator.is_main_process else None,
+            columns_to_keep=["messages"],
+        )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if args.train_file is not None:
+            data_files["train"] = args.train_file
+        raw_datasets = load_dataset(
+            "json",
+            data_files=data_files,
+            **dataset_args,
+        )
+
+    # Load pretrained model and tokenizer
+    if args.config_name:
+        config = AutoConfig.from_pretrained(
+            args.config_name,
+            revision=args.model_revision,
+            trust_remote_code=args.trust_remote_code,
+        )
+    elif args.model_name_or_path:
+        config = AutoConfig.from_pretrained(
+            args.model_name_or_path,
+            revision=args.model_revision,
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        raise ValueError(
+            "You are instantiating a new config instance from scratch. This is not supported by this script."
+        )
+
+    tokenizer_revision = args.model_revision if args.tokenizer_revision is None else args.tokenizer_revision
+    if tokenizer_revision != args.model_revision:
+        # Warn user if tokenizer and model use different revisions; this is an unusual
+        # use case.
+        warning = f"""Requested tokenizer revision `{tokenizer_revision}` is different
+                   from the model revision `{args.model_revision}`."""
+        logger.warning(warning)
+
+    if use_unsloth:
+        
+        max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
+        dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+        load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
+
+        policy, tokenizer = FastLanguageModel.from_pretrained(
+            model_name =  args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+            max_seq_length = max_seq_length,
+            dtype = dtype,
+            load_in_4bit = load_in_4bit,
+            )
+    else: 
+        if args.tokenizer_name:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.tokenizer_name,
+                trust_remote_code=args.trust_remote_code,
+                use_fast=not args.use_slow_tokenizer,
+                revision=tokenizer_revision,
+                token=os.getenv("HF_TOKEN", None),
+            )
+        elif args.model_name_or_path:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.model_name_or_path,
+                trust_remote_code=args.trust_remote_code,
+                use_fast=not args.use_slow_tokenizer,
+                revision=tokenizer_revision,
+                token=os.getenv("HF_TOKEN", None),
+            )
+        else:
+            raise ValueError(
+                "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+                "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+            )
+
+        if args.model_name_or_path:
+            if args.use_qlora:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                device_index = accelerator.local_process_index
+                device_map = {"": device_index}  # force data-parallel training.
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    quantization_config=bnb_config,
+                    device_map=device_map,
+                    trust_remote_code=args.trust_remote_code,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
+                    revision=args.model_revision,
+                    token=os.getenv("HF_TOKEN", None),
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path,
+                    from_tf=bool(".ckpt" in args.model_name_or_path),
+                    config=config,
+                    trust_remote_code=args.trust_remote_code,
+                    low_cpu_mem_usage=args.low_cpu_mem_usage,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2" if args.use_flash_attn else "eager",
+                    revision=args.model_revision,
+                    token=os.getenv("HF_TOKEN", None),
+                )
+        else:
+            logger.info("Training new model from scratch")
+            model = AutoModelForCausalLM.from_config(config)
+
+    # no default pad token for llama!
+    # here we add all special tokens again, because the default ones are not in the special_tokens_map
+    if isinstance(tokenizer, LlamaTokenizer) or isinstance(tokenizer, LlamaTokenizerFast):
+        num_added_tokens = tokenizer.add_special_tokens(
+            {
+                "bos_token": "<s>",
+                "eos_token": "</s>",
+                "unk_token": "<unk>",
+                "pad_token": "<pad>",
+            }
+        )
+        assert num_added_tokens in [
+            0,
+            1,
+        ], "LlamaTokenizer should only add one special token - the pad_token, or no tokens if pad token present."
+    elif isinstance(tokenizer, GPTNeoXTokenizerFast):
+        # OLMo newer models use this tokenizer
+        if tokenizer.bos_token is None:
+            tokenizer.bos_token = tokenizer.eos_token
+            assert (
+                args.add_bos
+            ), "For OLMo with GPTNeoX, you must add bos token to the beginning of the input sequence."
+        # else, pythia / other models
+        else:
+            num_added_tokens = tokenizer.add_special_tokens(
+                {
+                    "pad_token": "<pad>",
+                }
+            )
+            assert num_added_tokens == 1, "GPTNeoXTokenizer should only add one special token - the pad_token."
+    elif isinstance(tokenizer, GPT2Tokenizer) and isinstance(model, OPTForCausalLM):
+        num_added_tokens = tokenizer.add_special_tokens({"unk_token": "<unk>"})
+    elif isinstance(tokenizer, transformers.PreTrainedTokenizerFast) and tokenizer.pad_token is None:
+        num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        assert num_added_tokens == 1, "We detected no padding token but add_special_tokens did not add one."
+
+    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+    # on a small vocab and want a smaller embedding size, remove this test.
+    # gather deepspeed to get "real" embedding size
+    embeddings = model.get_input_embeddings()
+    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+        embedding_size = embeddings.weight.shape[0]
+    # resize does its own gather
+    if len(tokenizer) > embedding_size:
+        # pad to multiple for tensor cores.
+        model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
+    # update embedding size after resizing for sum loss
+    embeddings = model.get_input_embeddings()
+    with deepspeed.zero.GatheredParameters(embeddings.weight, modifier_rank=None):
+        embedding_size = embeddings.weight.shape[0]
+
+    # set the tokenizer chat template to the tulu format
+    # this makes evaluation/etc easier down the line.
+    chat_template = (
+        "{% for message in messages %}\n"
+        "{% if message['role'] == 'system' %}\n"
+        "{{ '<|system|>\n' + message['content'] }}\n"
+        "{% elif message['role'] == 'user' %}\n"
+        "{{ '<|user|>\n' + message['content'] }}\n"
+        "{% elif message['role'] == 'assistant' %}\n"
+        "{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n"
+        "{% endif %}\n"
+        "{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n"
+        "{% endif %}\n"
+        "{% endfor %}"
+    )
+    tokenizer.chat_template = chat_template
+    if args.add_bos:
+        # also add bos in the chat template
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+
+    if args.use_lora:
+        if args.use_qlora:
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
+
+        logger.info("Initializing LORA model...")
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+    elif args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    # Preprocessing the datasets.
+    if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
+        encode_function = partial(
+            encode_with_prompt_completion_format,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos=args.add_bos,
+        )
+    elif "messages" in raw_datasets["train"].column_names:
+        encode_function = partial(
+            encode_with_messages_format,
+            tokenizer=tokenizer,
+            max_seq_length=args.max_seq_length,
+            add_bos=args.add_bos,
+        )
+    else:
+        raise ValueError("You need to have either 'prompt'&'completion' or 'messages' in your column names.")
+
+    train_dataset = raw_datasets["train"]
+
+    # debugging tool for fewer samples
+    if args.max_train_samples is not None:
+        max_train_samples = min(len(train_dataset), args.max_train_samples)
+        logger.info(f"Limiting training samples to {max_train_samples} from {len(train_dataset)}.")
+        train_dataset = train_dataset.select(range(max_train_samples))
+
+    with accelerator.main_process_first():
+        train_dataset = train_dataset.map(
+            encode_function,
+            batched=False,
+            num_proc=args.preprocessing_num_workers,
+            load_from_cache_file=not args.overwrite_cache,
+            remove_columns=[
+                name for name in train_dataset.column_names if name not in ["input_ids", "labels", "attention_mask"]
+            ],
+            desc="Tokenizing and reformatting instruction data",
+        )
+        train_dataset.set_format(type="pt")
+        train_dataset = train_dataset.filter(lambda example: (example["labels"] != -100).any())
+
+    # Log a few random samples from the training set:
+    for index in random.sample(range(len(train_dataset)), 3):
+        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    # DataLoaders creation:
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
+        batch_size=args.per_device_train_batch_size,
+    )
+
+    # Optimizer
+    # Split weights in two groups, one with weight decay and the other not.
+    no_decay = ["bias", "layer_norm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+        },
+    ]
+    if args.use_qlora:
+        from bitsandbytes.optim import AdamW
+
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=args.learning_rate,
+            optim_bits=8 if args.use_8bit_optimizer else 32,
+            is_paged=True,
+        )
+    else:
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, fused=args.fused_optimizer)
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    # Create the learning rate scheduler.
+    # Note: the current accelerator.step() calls the .step() of the real scheduler
+    # for the `num_processes` times. This is because they assume
+    # the user initialize the scheduler with the entire training set.
+    # In the case of data parallel training, each process only
+    # sees a subset (1/num_processes) of the training set.
+    # So each time the process needs to update the lr multiple times so that the total
+    # number of updates in the end matches the num_training_steps here.
+    # Here we need to set the num_training_steps to either using the
+    # entire training set (when epochs is specified) or we need to multiply the
+    # num_training_steps by num_processes so that the total number of
+    # updates matches the num_training_steps.
+    num_training_steps_for_scheduler = (
+        args.max_train_steps if overrode_max_train_steps else args.max_train_steps * accelerator.num_processes
+    )
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler_type,
+        optimizer=optimizer,
+        num_training_steps=num_training_steps_for_scheduler,
+        num_warmup_steps=int(num_training_steps_for_scheduler * args.warmup_ratio),
+    )
+    # Prepare everything with `accelerator`.
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # Figure out how many steps we should save the Accelerator states
+    checkpointing_steps = args.checkpointing_steps
+    if checkpointing_steps is not None and str(checkpointing_steps).lower() != "epoch":
+        checkpointing_steps = int(checkpointing_steps)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if is_beaker_job():
+        beaker_config = maybe_get_beaker_config()
+    if args.with_tracking:
+        experiment_config = vars(args)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"]
+
+        # (Optional) Ai2 internal tracking
         if args.wandb_entity is None:
             args.wandb_entity = maybe_use_ai2_wandb_entity()
-    return accelerator
-
-
-def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
-    accelerator = calculate_runtime_args_and_accelerator(args, model_config)
-    local_seed = args.seed + accelerator.process_index
-
-    # set up experiment tracking and seeds
-    if accelerator.is_main_process:
-        if args.with_tracking:
-            import wandb
-
-            wandb.init(
-                project=args.wandb_project_name,
-                entity=args.wandb_entity,
-                sync_tensorboard=True,
-                config={**asdict(args), **asdict(dataset_config), **asdict(model_config)},
-                name=args.run_name,
-                save_code=True,
-                tags=[args.exp_name] + get_wandb_tags(),
-            )
-        writer = SummaryWriter(f"runs/{args.run_name}")
-        writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            experiment_config.update(vars(beaker_config))
+        accelerator.init_trackers(
+            "open_instruct_internal",
+            experiment_config,
+            init_kwargs={"wandb": {"entity": args.wandb_entity, "tags": [args.exp_name] + get_wandb_tags()}},
         )
-    device = torch.device(f"cuda:{accelerator.local_process_index}")
-    random.seed(local_seed)
-    np.random.seed(local_seed)
-    torch.manual_seed(local_seed)
-    torch.backends.cudnn.deterministic = True
+        wandb_tracker = accelerator.get_tracker("wandb")
 
-    #Create the models
-    max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
-    dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
-    load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
+    # Train!
+    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    #creating unsloth FastLanguageModel and turning them into peft models
-    policy, _ = FastLanguageModel.from_pretrained(
-      model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
-      max_seq_length = max_seq_length,
-      dtype = dtype,
-      load_in_4bit = load_in_4bit,
-      #token  = "" 
-    )
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    completed_steps = 0
+    starting_epoch = 0
 
-    policy = FastLanguageModel.get_peft_model(
-        policy,
-        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj",],
-        lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
-        bias = "none",    # Supports any, but = "none" is optimized
-        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
-        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
-        random_state = 3407,
-        use_rslora = False,  # We support rank stabilized LoRA
-        loftq_config = None, # And LoftQ
-    )
+    # Potentially load in the weights and states from a previous save
+    last_checkpoint_path = get_last_checkpoint_path(args)
+    if last_checkpoint_path:
+        accelerator.print(f"Resumed from checkpoint: {last_checkpoint_path}")
+        accelerator.load_state(last_checkpoint_path)
+        # Extract `epoch_{i}` or `step_{i}`
+        last_checkpoint_path = os.path.basename(last_checkpoint_path)
+        training_difference = os.path.splitext(last_checkpoint_path)[0]
 
-    ref_policy, tokenizer = FastLanguageModel.from_pretrained(
-      model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
-      max_seq_length = max_seq_length,
-      dtype = dtype,
-      load_in_4bit = load_in_4bit,
-      #token = "" 
+        if "epoch" in training_difference:
+            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
+            resume_step = None
+            completed_steps = starting_epoch * num_update_steps_per_epoch
+        else:
+            # need to multiply `gradient_accumulation_steps` to reflect real steps
+            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
+            starting_epoch = resume_step // len(train_dataloader)
+            completed_steps = resume_step // args.gradient_accumulation_steps
+            resume_step -= starting_epoch * len(train_dataloader)
 
-    )
+    print(f"Starting from epoch {starting_epoch} and step {completed_steps}.")
+    # update the progress_bar if load from checkpoint
+    progress_bar.update(completed_steps)
 
-    ref_model = FastLanguageModel.get_peft_model(
-        ref_policy,
-        r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj",],
-        lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
-        bias = "none",    # Supports any, but = "none" is optimized
-        # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
-        use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
-        random_state = 3407,
-        use_rslora = False,  # We support rank stabilized LoRA
-        loftq_config = None, # And LoftQ
-    )
+    for epoch in range(starting_epoch, args.num_train_epochs):
+        model.train()
+        train_dataloader.set_epoch(epoch)
+        total_loss = 0
+        total_aux_loss = 0
+        if last_checkpoint_path and resume_step is not None:
+            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
+        else:
+            active_dataloader = train_dataloader
+        for step, batch in enumerate(active_dataloader):
+            with accelerator.accumulate(model):
+                if args.load_balancing_loss:
+                    outputs = model(**batch, use_cache=False, output_router_logits=True)
+                else:
+                    outputs = model(**batch, use_cache=False)
+                if args.reduce_loss == "mean":
+                    loss = outputs.loss
+                else:
+                    # reduce loss is sum
+                    # this ensures that we weight all tokens in the dataset equally,
+                    # rather than weighting each overall example equally when
+                    # using high amounts of gradient accumulation.
+                    # this can result in > 5 point improvements in AlpacaEval
+                    # see https://github.com/huggingface/transformers/issues/24725 for
+                    # more discussion and details.
+                    logits = outputs.logits
+                    labels = batch["labels"]
+                    # Shift so that tokens < n predict n
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    # Flatten the tokens
+                    loss_fct = torch.nn.CrossEntropyLoss(reduction="sum")
+                    shift_logits = shift_logits.view(-1, embedding_size)
+                    shift_labels = shift_labels.view(-1)
+                    # Enable model parallelism
+                    shift_labels = shift_labels.to(shift_logits.device)
+                    loss = loss_fct(shift_logits, shift_labels)
+                    if args.load_balancing_loss:
+                        aux_loss = args.load_balancing_weight * outputs.aux_loss
+                        loss += aux_loss
+                # We keep track of the loss at each logged step
+                total_loss += loss.detach().float()
+                with torch.cuda.amp.autocast(dtype = torch.float16):
+                    accelerator.backward(loss)
+                if args.load_balancing_loss:
+                    total_aux_loss += aux_loss.detach().float()
+                # clip gradient norm. don't do this with deepspeed
+                if accelerator.sync_gradients and args.clip_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+                lr_scheduler.step()
 
-    # create a tokenizer (pad from right)
-    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, padding_side="right")
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # NOTE: we do not resize the embedding
-    tokenizer.chat_template = CHAT_TEMPLATES[dataset_config.chat_template]
-
-    # create the dataset
-    dataset = load_dataset("trl-internal-testing/sentiment-trl-style")
-    dataset_processor = SFTDatasetProcessor(tokenizer=tokenizer, config=dataset_config)
-    dataset_processor.sanity_check_(dataset)
-    with accelerator.main_process_first():
-        dataset = dataset_processor.tokenize(dataset)
-        dataset = dataset_processor.filter(dataset)
-    train_dataset = dataset[dataset_config.dataset_train_split]
-    eval_dataset = dataset[dataset_config.dataset_eval_split]
-
-    # some more runtime logging
-    if accelerator.is_main_process:
-        pprint([args, dataset_config, model_config])
-        visualize_token(train_dataset[0][INPUT_IDS_PROMPT_KEY], tokenizer)
-        if args.with_tracking:
-            # upload the visualized token length
-            dataset_processor.get_token_length_visualization(
-                dataset, save_path=f"runs/{args.run_name}/token_length.png"
-            )
-            wandb.log({"token_length": wandb.Image(f"runs/{args.run_name}/token_length.png")})
-
-    # create the reward model and optimizer
-    reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
-        args.reward_model_path,
-        num_labels=1,
-        torch_dtype=torch.bfloat16,
-        #attn_implementation="flash_attention_2",
-        use_cache=False,
-    )
-    model = policy
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    for module in [model, ref_model, reward_model]:
-        disable_dropout_in_model(module)
-    if args.stop_token:
-        if args.stop_token == "eos":
-            args.stop_token_id = tokenizer.eos_token_id
-        if args.stop_token == "period":
-            args.stop_token_id = tokenizer.encode(".")[0]
-    optimizer = bnb.optim.Adam(policy.parameters(), lr=args.learning_rate, betas=(0.9, 0.995), optim_bits=8, percentile_clipping=5,eps=args.eps)
-    scheduler = get_scheduler(
-        args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.num_training_steps * args.num_train_epochs,
-    )
-    data_collator = SimpleGenerateCollator(pad_token_id=tokenizer.pad_token_id)
-    dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.local_dataloader_batch_size,
-        shuffle=True,
-        collate_fn=data_collator,
-        drop_last=True,  # needed; otherwise the last batch will be of ragged shape
-    )
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=args.per_device_eval_batch_size,
-        shuffle=False,  # no need to shuffle
-        collate_fn=data_collator,
-        drop_last=True,  # needed; otherwise the last batch will be of ragged shape
-    )
-
-    # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
-    # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
-    torch.manual_seed(args.seed)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    eval_dataloader = accelerator.prepare(eval_dataloader)
-    torch.manual_seed(local_seed)
-
-    # deepspeed setup
-    is_deepspeed_enabled = getattr(accelerator.state, "deepspeed_plugin", None) is not None
-    mixed_precision = accelerator.state.mixed_precision
-    if is_deepspeed_enabled:
-        reward_model = prepare_deepspeed(reward_model, args.per_device_train_batch_size, mixed_precision)
-        ref_model = prepare_deepspeed(ref_model, args.per_device_train_batch_size, mixed_precision)
-    else:
-        reward_model = reward_model.to(device)
-        ref_model = ref_model.to(device)
-
-    # online generation config
-    def repeat_generator():
-        while True:
-            yield from dataloader
-
-    iter_dataloader = iter(repeat_generator())
-    generation_config = GenerationConfig(
-        max_new_tokens=args.response_length,
-        min_new_tokens=args.response_length,
-        temperature=(args.temperature + 1e-7),
-        top_k=0.0,
-        top_p=1.0,
-        do_sample=True,
-        # eos_token_id=args.stop_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-
-    # set up the metrics and initial states
-    stats_shape = (args.num_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
-    loss_stats = torch.zeros(stats_shape, device=device)
-    chosen_rewards_stats = torch.zeros(stats_shape, device=device)
-    rejected_rewards_stats = torch.zeros(stats_shape, device=device)
-    chosen_logprobs_stats = torch.zeros(stats_shape, device=device)
-    rejected_logprobs_stats = torch.zeros(stats_shape, device=device)
-    episode = 0
-    model.train()
-
-    # training loop
-    start_time = time.time()
-    for training_step in range(1, args.num_training_steps + 1):
-        episode += 1 * args.batch_size
-        scheduler.step()
-        data = next(iter_dataloader)
-
-        # # (optionally) evaluate the model
-        # if args.num_evals > 0 and (training_step - 1) % args.eval_freq == 0:
-        #     table = evaluate(
-        #         model,
-        #         reward_model,
-        #         accelerator,
-        #         args.stop_token_id,
-        #         eval_dataloader,
-        #         tokenizer,
-        #         args.response_length,
-        #     )
-        #     for key in table:
-        #         table[key] = gather_object(table[key])
-        #     df = pd.DataFrame(table)
-        #     if accelerator.is_main_process:
-        #         if args.with_tracking:
-        #             wandb.log({"sample_completions": wandb.Table(dataframe=df)})
-        #         else:
-        #             print_rich_table(df)
-        #     del table, df
-
-        with torch.no_grad():
-            queries = data[INPUT_IDS_PROMPT_KEY].to(device)
-            queries = queries.repeat(args.num_generation_per_prompt, 1)
-            context_length = queries.shape[1]
-            responses = []
-            postprocessed_responses = []
-            logprobs = []
-            ref_logprobs = []
-            scores = []
-            sequence_lengths = []
-            with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
-                query_responses, logitss = unsloth_batch_generation(
-                    unwrapped_model,
-                    queries,
-                    args.local_rollout_forward_batch_size,
-                    tokenizer.pad_token_id,
-                    generation_config,
-                )
-            FastLanguageModel.for_training(model)
-            FastLanguageModel.for_training(ref_policy)
-            training_time_start = time.time()
-            for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
-                query = queries[i : i + args.local_rollout_forward_batch_size]
-                query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                response = query_response[:, context_length:]
-                #logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                model_output = forward(model, query_response, tokenizer.pad_token_id)
-                logits = model_output.logits[:, context_length - 1 : -1]
-                logitss[i : i + args.local_rollout_forward_batch_size] = logits
-                logits /= args.temperature + 1e-7
-                all_logprob = F.log_softmax(logits, dim=-1)
-                logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-                del logits, all_logprob
-                torch.cuda.empty_cache()
-
-                ref_output = forward(ref_model, query_response, tokenizer.pad_token_id)
-                ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                ref_logits /= args.temperature + 1e-7
-                ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
-                del ref_output, ref_logits, ref_all_logprob
-                torch.cuda.empty_cache()
-
-                # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
-                postprocessed_response = response
-                if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
-                    postprocessed_response = truncate_response(args.stop_token_id, tokenizer.pad_token_id, response)
-
-                # Response Processing 2. run reward model on the truncated responses
-                postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-
-                #print("postprocessed_query_response: ", tokenizer.decode(postprocessed_query_response))
-                
-                sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
-                _, score, _ = get_reward(
-                    reward_model, postprocessed_query_response, tokenizer.pad_token_id, context_length
-                )
-
-                responses.append(response)
-                postprocessed_responses.append(postprocessed_response)
-                logprobs.append(logprob)
-                ref_logprobs.append(ref_logprob)
-                sequence_lengths.append(sequence_length)
-                scores.append(score)
-            responses = torch.cat(responses, 0)
-            postprocessed_responses = torch.cat(postprocessed_responses, 0)
-            logprobs = torch.cat(logprobs, 0)
-            ref_logprobs = torch.cat(ref_logprobs, 0)
-            sequence_lengths = torch.cat(sequence_lengths, 0)
-            scores = torch.cat(scores, 0)
-            # del (logprob, ref_logprob, score, unwrapped_model)
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
-            # responses not passing that filter will receive a low (fixed) score
-            # only query humans on responses that pass that filter
-            contain_stop_token = torch.any(postprocessed_responses == args.stop_token_id, dim=-1)
-            # NOTE: only apply the stop token filter if the response is long enough
-            # otherwise the model could learn to generate the first token as the stop token
-            contain_stop_token = contain_stop_token & (sequence_lengths >= args.min_response_length)
-            if args.non_stop_penalty:
-                scores = torch.where(contain_stop_token, scores, torch.full_like(scores, args.penalty_reward_value))
-
-            # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-            response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-            padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-            logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-
-            # 4. compute rewards
-            kl = logprobs - ref_logprobs
-            non_score_reward = -args.beta * kl
-            non_score_reward_sum = non_score_reward.sum(1)
-            rlhf_reward = scores + non_score_reward_sum
-
-            # num_examples should be same as args.local_batch_size divided by 2
-            num_examples = scores.size(0) // 2
-            first_half = scores[:num_examples]
-            second_half = scores[num_examples:]
-
-            num_examples_range = torch.arange(num_examples).to(scores.device)
-            chosen_indices = torch.where(
-                first_half >= second_half, num_examples_range.clone(), num_examples_range.clone() + num_examples
-            )
-            rejected_indices = torch.where(
-                first_half < second_half, num_examples_range.clone(), num_examples_range.clone() + num_examples
-            )
-            scores_margin = scores[chosen_indices] - scores[rejected_indices]
-
-        # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-        for epoch_idx in range(args.num_epochs):
-            b_inds = np.random.permutation(args.local_batch_size // args.num_generation_per_prompt)
-            minibatch_idx = 0
-            for mini_batch_start in range(
-                0,
-                args.local_batch_size // args.num_generation_per_prompt,
-                args.local_mini_batch_size // args.num_generation_per_prompt,
-            ):
-                mini_batch_end = mini_batch_start + args.local_mini_batch_size // args.num_generation_per_prompt
-                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
-                gradient_accumulation_idx = 0
-                for micro_batch_start in range(
-                    0,
-                    args.local_mini_batch_size // args.num_generation_per_prompt,
-                    args.per_device_train_batch_size,
-                ):
-                    with accelerator.accumulate(model):
-                        micro_batch_end = micro_batch_start + args.per_device_train_batch_size
-                        micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                        chosen_mb_inds = chosen_indices[micro_batch_inds]
-                        chosen_responses = responses[chosen_mb_inds]
-                        rejected_mb_inds = rejected_indices[micro_batch_inds]
-                        rejected_responses = responses[rejected_mb_inds]
-
-                        concat_mb_inds = torch.cat((chosen_mb_inds, rejected_mb_inds), dim=0)
-                        concat_query_responses = query_responses[concat_mb_inds]
-                        concat_output = forward(model, concat_query_responses, tokenizer.pad_token_id)
-                        num_examples = chosen_mb_inds.shape[0]
-                        chosen_logits = concat_output.logits[:num_examples]
-                        rejected_logits = concat_output.logits[num_examples:]
-
-                        # chosen
-                        chosen_logits = chosen_logits[:, context_length - 1 : -1]
-                        chosen_logits /= args.temperature + 1e-7
-                        chosen_all_logprobs = F.log_softmax(chosen_logits, dim=-1)
-                        chosen_logprobs = torch.gather(chosen_all_logprobs, 2, chosen_responses.unsqueeze(-1)).squeeze(
-                            -1
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                completed_steps += 1
+                if args.logging_steps and completed_steps % args.logging_steps == 0:
+                    avg_loss = (
+                        accelerator.gather(total_loss).mean().item()
+                        / args.gradient_accumulation_steps
+                        / args.logging_steps
+                    )
+                    metrics_to_log = {
+                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "train_loss": avg_loss,
+                    }
+                    if args.load_balancing_loss:
+                        avg_aux_loss = (
+                            accelerator.gather(total_aux_loss).mean().item()
+                            / args.gradient_accumulation_steps
+                            / args.logging_steps
                         )
-                        chosen_logprobs = torch.masked_fill(
-                            chosen_logprobs, padding_mask[chosen_mb_inds], INVALID_LOGPROB
+                        logger.info(
+                            f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}, Aux Loss: {avg_aux_loss}"
                         )
-                        chosen_ref_logprobs = ref_logprobs[chosen_mb_inds]
-                        chosen_logprobs_sum = (chosen_logprobs * ~padding_mask[chosen_mb_inds]).sum(1)
-                        chosen_ref_logprobs_sum = (chosen_ref_logprobs * ~padding_mask[chosen_mb_inds]).sum(1)
-
-                        # rejected
-                        rejected_logits = rejected_logits[:, context_length - 1 : -1]
-                        rejected_logits /= args.temperature + 1e-7
-                        rejected_all_logprobs = F.log_softmax(rejected_logits, dim=-1)
-                        rejected_logprobs = torch.gather(
-                            rejected_all_logprobs, 2, rejected_responses.unsqueeze(-1)
-                        ).squeeze(-1)
-                        rejected_logprobs = torch.masked_fill(
-                            rejected_logprobs, padding_mask[rejected_mb_inds], INVALID_LOGPROB
+                        metrics_to_log["aux_loss"] = avg_aux_loss
+                    else:
+                        logger.info(
+                            f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}"
                         )
-                        rejected_ref_logprobs = ref_logprobs[rejected_mb_inds]
-                        rejected_logprobs_sum = (rejected_logprobs * ~padding_mask[rejected_mb_inds]).sum(1)
-                        rejected_ref_logprobs_sum = (rejected_ref_logprobs * ~padding_mask[rejected_mb_inds]).sum(1)
+                    if args.with_tracking:
+                        accelerator.log(
+                            metrics_to_log,
+                            step=completed_steps,
+                        )
+                    total_loss = 0
+                    total_aux_loss = 0
 
-                        pi_logratios = chosen_logprobs_sum - rejected_logprobs_sum
-                        ref_logratios = chosen_ref_logprobs_sum - rejected_ref_logprobs_sum
+                if isinstance(checkpointing_steps, int):
+                    if completed_steps % checkpointing_steps == 0:
+                        output_dir = f"step_{completed_steps}"
+                        if args.output_dir is not None:
+                            output_dir = os.path.join(args.output_dir, output_dir)
+                        accelerator.save_state(output_dir)
+                        # use this to mark the checkpoint as completely saved, to avoid restoring from garbled checkpoints
+                        with open(
+                            os.path.join(get_last_checkpoint_path(args, incomplete=True), "COMPLETED"), "w"
+                        ) as f:
+                            f.write("COMPLETED")  # annoyingly, empty files arent uploaded by beaker.
+                        if accelerator.is_local_main_process:
+                            clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
+                        accelerator.wait_for_everyone()
 
-                        logits = pi_logratios - ref_logratios
+                if completed_steps >= args.max_train_steps:
+                    break
 
-                        if args.loss_type == "sigmoid":
-                            losses = -F.logsigmoid(args.beta * logits)
-                        elif args.loss_type == "ipo":
-                            losses = (logits - 1 / (2 * args.beta)) ** 2
-                        else:
-                            raise NotImplementedError(f"invalid loss type {args.loss_type}")
-                        
-                        with torch.cuda.amp.autocast(dtype = torch.float16):
-                            loss = losses.mean()
-                            accelerator.backward(loss)
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        with torch.no_grad():
-                            chosen_rewards = args.beta * (chosen_logprobs_sum - chosen_ref_logprobs_sum)
-                            rejected_rewards = args.beta * (rejected_logprobs_sum - rejected_ref_logprobs_sum)
-                            loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = loss
-                            chosen_rewards_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                chosen_rewards.mean()
-                            )
-                            rejected_rewards_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                rejected_rewards.mean()
-                            )
-                            chosen_logprobs_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                chosen_logprobs_sum.mean()
-                            )
-                            rejected_logprobs_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
-                                rejected_logprobs_sum.mean()
-                            )
-                    gradient_accumulation_idx += 1
-                minibatch_idx += 1
-                # fmt: off
-                del (
-                    loss, logits, concat_output, concat_query_responses,
-                    chosen_logits, rejected_logits, chosen_logprobs, rejected_logprobs,
-                    chosen_responses, rejected_responses,
-                )
-                # fmt: on
-                # del everything and empty cache
-                torch.cuda.empty_cache()
-        with torch.no_grad():
-            g_chosen_reward = accelerator.gather(chosen_rewards_stats)
-            g_rejected_reward = accelerator.gather(rejected_rewards_stats)
-            metrics = {
-                "episode": episode,
-                "lr": scheduler.get_last_lr()[0],
-                "epoch": episode / len(train_dataset),
-                "time/from_scratch": time.time() - start_time,
-                "time/training": time.time() - training_time_start,
-                "val/num_stop_token_ids": (responses == args.stop_token_id).sum().item(),
-                "objective/kl": accelerator.gather(kl.sum(1).mean()).mean().item(),
-                "objective/entropy": accelerator.gather((-logprobs).sum(1).mean()).mean().item(),
-                "objective/non_score_reward": accelerator.gather(non_score_reward_sum).mean().item(),
-                "objective/rlhf_reward": accelerator.gather(rlhf_reward).mean().item(),
-                "objective/scores": accelerator.gather(scores.mean()).mean().item(),
-                "objective/scores_margin": accelerator.gather(scores_margin.mean()).mean().item(),
-                "objective/loss": accelerator.gather(loss_stats).mean().item(),
-                "rewards/chosen": g_chosen_reward.mean().item(),
-                "rewards/rejected": g_rejected_reward.mean().item(),
-                "rewards/accuracies": (g_chosen_reward > g_rejected_reward).float().mean().item(),
-                "rewards/margins": (g_chosen_reward - g_rejected_reward).mean().item(),
-                "logps/chosen": accelerator.gather(chosen_logprobs_stats).mean().item(),
-                "logps/rejected": accelerator.gather(rejected_logprobs_stats).mean().item(),
-            }
-            if accelerator.is_main_process:
-                print_rich_single_line_metrics(metrics)
-                for key, value in metrics.items():
-                    writer.add_scalar(key, value, episode)
-        del (queries, responses, postprocessed_responses, logprobs, ref_logprobs, sequence_lengths, scores)
-        del (metrics, kl, non_score_reward, rlhf_reward)
-        del (g_chosen_reward, g_rejected_reward)
-        gc.collect()
-        torch.cuda.empty_cache()
+        if checkpointing_steps == "epoch":
+            output_dir = f"epoch_{epoch}"
+            if args.output_dir is not None:
+                output_dir = os.path.join(args.output_dir, output_dir)
+            accelerator.save_state(output_dir)
+            # use this to mark the checkpoint as completely saved, to avoid restoring from garbled checkpoints
+            with open(os.path.join(get_last_checkpoint_path(args, incomplete=True), "COMPLETED"), "w") as f:
+                f.write("COMPLETED")  # annoyingly, empty files arent uploaded by beaker.
+            if accelerator.is_local_main_process:
+                clean_last_n_checkpoints(args.output_dir, args.keep_last_n_checkpoints)
+            accelerator.wait_for_everyone()
 
-    # save model
-    os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-    original_tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path)
-    save_with_accelerate(
-        accelerator,
-        model,
-        original_tokenizer,
-        args.output_dir,
-        False,
-        args.push_to_hub,
-        args.hf_repo_id,
-        args.hf_repo_revision,
-    )
+    if args.output_dir is not None:
+        save_with_accelerate(
+            accelerator,
+            model,
+            tokenizer,
+            args.output_dir,
+            args.use_lora,
+        )
+
+    # remove all checkpoints to save space
+    if accelerator.is_local_main_process:
+        clean_last_n_checkpoints(args.output_dir, keep_last_n_checkpoints=0)
+
+    if is_beaker_job() and accelerator.is_main_process:
+        # dpo script only supports these two options right now for datasets
+        if args.dataset_mixer:
+            dataset_list = list(args.dataset_mixer.keys())
+        elif args.dataset_mixer_list:
+            dataset_list = args.dataset_mixer_list[::2]  # even indices
+        elif args.dataset_name:
+            dataset_list = [args.dataset_name]
+        else:
+            dataset_list = [args.train_file]
+        # mainly just focussing here on what would be useful for the leaderboard.
+        # wandb will have even more useful information.
+        metadata_blob = {
+            "model_name": args.exp_name,
+            "model_type": "sft",
+            "datasets": dataset_list,
+            "base_model": args.model_name_or_path,
+            "wandb_path": wandb_tracker.run.get_url(),
+            "beaker_experiment": beaker_config.beaker_experiment_url,
+            "beaker_datasets": beaker_config.beaker_dataset_id_urls,
+        }
+        # save metadata to the output directory. then it should also get pushed to HF.
+        with open(os.path.join(args.output_dir, "metadata.json"), "w") as f:
+            json.dump(metadata_blob, f)
+
+        # upload metadata to the dataset if set
+        if args.hf_metadata_dataset:
+            upload_metadata_to_hf(
+                metadata_blob,
+                "metadata.json",
+                args.hf_metadata_dataset,
+                "results/" + args.hf_repo_revision,  # to match what the auto-evals name as.
+            )
+
+        if args.try_launch_beaker_eval_jobs:
+            command = f"""\
+            python mason.py  \
+                --cluster ai2/allennlp-cirrascale ai2/general-cirrascale-a5000 ai2/general-cirrascale-a5000 ai2/s2-cirrascale ai2/general-cirrascale \
+                --priority low \
+                --preemptible \
+                --budget ai2/allennlp \
+                --workspace ai2/tulu-2-improvements \
+                --image nathanl/open_instruct_auto \
+                --pure_docker_mode \
+                --gpus 0 -- python scripts/wait_beaker_dataset_model_upload_then_evaluate_model.py \
+                --beaker_workload_id {beaker_config.beaker_workload_id} \
+                --model_name {args.hf_repo_revision}
+            """
+            process = subprocess.Popen(["bash", "-c", command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            print(f"Submit jobs after model training is finished - Stdout:\n{stdout.decode()}")
+            print(f"Submit jobs after model training is finished - Stderr:\n{stderr.decode()}")
+            print(f"Submit jobs after model training is finished - process return code: {process.returncode}")
+
+    if args.push_to_hub:
+        push_folder_to_hub(
+            accelerator,
+            args.output_dir,
+            args.hf_repo_id,
+            args.hf_repo_revision,
+        )
+    accelerator.wait_for_everyone()
+    if args.with_tracking:
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
-
-    # print("Before deletion:")
-    # print("Args, ", dir(Args))  # List all attributes
-    # if hasattr(Args, 'gradient_checkpointing'):
-    #     print("Deleting Args.gradient_checkpointing")
-    #     del Args.gradient_checkpointing
-    # print("After deletion:")
-    # print("Args, ", dir(Args))  # Check if it was deleted
-    ModelConfig.gradient_checkpointing = True
-    parser = ArgumentParserPlus((Args, DatasetConfig, ModelConfig))
-
-    main(*parser.parse())
+    parser = ArgumentParserPlus((FlatArguments))
+    args = parser.parse()
+    main(args)
