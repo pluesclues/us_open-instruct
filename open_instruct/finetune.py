@@ -65,7 +65,7 @@ from open_instruct.utils import (
     maybe_use_ai2_wandb_entity,
     upload_metadata_to_hf,
 )
-
+from unsloth import FastLanguageModel
 logger = get_logger(__name__)
 
 
@@ -78,7 +78,7 @@ class FlatArguments:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """The name of this experiment"""
     model_name_or_path: Optional[str] = field(
-        default=None,
+        default="unsloth/tinyllama-bnb-4bit",
         metadata={
             "help": (
                 "The model checkpoint for weights initialization. Don't set if you want to train a model from scratch."
@@ -465,6 +465,8 @@ def main(args: FlatArguments):
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
+    use_unsloth=  args.use_unsloth
+    print("use_unsloth is: ", use_unsloth)
     if args.push_to_hub:
         if args.hf_repo_id is None:  # auto-generate one
             args.hf_repo_id = "open_instruct_dev"
@@ -585,11 +587,13 @@ def main(args: FlatArguments):
         dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
         load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
 
-        policy, tokenizer = FastLanguageModel.from_pretrained(
-            model_name =  args.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name =  "unsloth/tinyllama-bnb-4bit", # "unsloth/tinyllama" for 16bit loading
             max_seq_length = max_seq_length,
             dtype = dtype,
             load_in_4bit = load_in_4bit,
+            low_cpu_mem_usage=False,
+            device_map = None
             )
     else: 
         if args.tokenizer_name:
@@ -722,24 +726,39 @@ def main(args: FlatArguments):
     if args.add_bos:
         # also add bos in the chat template
         tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+    if use_unsloth:
+          model = FastLanguageModel.get_peft_model(
+                model,
+                r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+                target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj",],
+                lora_alpha = 16,
+                lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+                bias = "none",    # Supports any, but = "none" is optimized
+                # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+                use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
+                random_state = 3407,
+                use_rslora = False,  # We support rank stabilized LoRA
+                loftq_config = None, # And LoftQ
+            )
+    else:
+      if args.use_lora:
+          if args.use_qlora:
+              model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
-    if args.use_lora:
-        if args.use_qlora:
-            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
-
-        logger.info("Initializing LORA model...")
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
-        )
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
-    elif args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+          logger.info("Initializing LORA model...")
+          peft_config = LoraConfig(
+              task_type=TaskType.CAUSAL_LM,
+              inference_mode=False,
+              r=args.lora_rank,
+              lora_alpha=args.lora_alpha,
+              lora_dropout=args.lora_dropout,
+              target_modules=["q_proj", "o_proj", "v_proj", "k_proj", "gate_proj", "up_proj", "down_proj"],
+          )
+          model = get_peft_model(model, peft_config)
+          model.print_trainable_parameters()
+      elif args.gradient_checkpointing:
+          model.gradient_checkpointing_enable()
 
     # Preprocessing the datasets.
     if "prompt" in raw_datasets["train"].column_names and "completion" in raw_datasets["train"].column_names:
@@ -806,13 +825,13 @@ def main(args: FlatArguments):
             "weight_decay": 0.0,
         },
     ]
-    if args.use_qlora:
+    if args.use_qlora or use_unsloth:
         from bitsandbytes.optim import AdamW
 
         optimizer = AdamW(
             optimizer_grouped_parameters,
             lr=args.learning_rate,
-            optim_bits=8 if args.use_8bit_optimizer else 32,
+            optim_bits=8 if args.use_8bit_optimizer or use_unsloth else 32,
             is_paged=True,
         )
     else:
