@@ -28,8 +28,7 @@ from transformers import (
     get_scheduler,
 )
 import sys
-#Added because of google collab path environments are not working as intended
-sys.path.append("/content/us_open-instruct/")
+sys.path.append("/home/kt828/us_open-instruct/") 
 
 from open_instruct.dataset_processor import (
     CHAT_TEMPLATES,

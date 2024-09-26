@@ -51,7 +51,8 @@ from transformers import (
     OPTForCausalLM,
     get_scheduler,
 )
-
+import sys
+sys.path.append("/home/kt828/us_open-instruct/") 
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.utils import (
     ArgumentParserPlus,
