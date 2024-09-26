@@ -51,7 +51,8 @@ from transformers import (
     OPTForCausalLM,
     get_scheduler,
 )
-
+import sys
+sys.path.append("/home/kt828/us_open-instruct/") 
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.utils import (
     ArgumentParserPlus,
@@ -584,17 +585,19 @@ def main(args: FlatArguments):
     if use_unsloth:
         
         max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
-        dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
-        load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
+        dtype = torch.bfloat16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+        load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
 
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name =  "unsloth/tinyllama-bnb-4bit", # "unsloth/tinyllama" for 16bit loading
             max_seq_length = max_seq_length,
             dtype = dtype,
             load_in_4bit = load_in_4bit,
-            low_cpu_mem_usage=False,
-            device_map = None
+            token = "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"
+            #low_cpu_mem_usage=False,
+            #device_map = None
             )
+        print("loaded unsloth model")
     else: 
         if args.tokenizer_name:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -620,6 +623,7 @@ def main(args: FlatArguments):
 
         if args.model_name_or_path:
             if args.use_qlora:
+                print("did not use qlora")
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_use_double_quant=True,
@@ -727,13 +731,13 @@ def main(args: FlatArguments):
         # also add bos in the chat template
         tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
     if use_unsloth:
-          model = FastLanguageModel.get_peft_model(
+        model = FastLanguageModel.get_peft_model(
                 model,
                 r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
                 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                                   "gate_proj", "up_proj", "down_proj",],
                 lora_alpha = 16,
-                lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+                lora_dropout = 0, # Supports any, but = 0 is optimized
                 bias = "none",    # Supports any, but = "none" is optimized
                 # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
                 use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
@@ -741,6 +745,7 @@ def main(args: FlatArguments):
                 use_rslora = False,  # We support rank stabilized LoRA
                 loftq_config = None, # And LoftQ
             )
+        print("Made fast language model into e peft model")
     else:
       if args.use_lora:
           if args.use_qlora:
@@ -892,9 +897,10 @@ def main(args: FlatArguments):
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"]
 
         # (Optional) Ai2 internal tracking
-        if args.wandb_entity is None:
-            args.wandb_entity = maybe_use_ai2_wandb_entity()
-            experiment_config.update(vars(beaker_config))
+        #if args.wandb_entity is None:
+        #    args.wandb_entity = maybe_use_ai2_wandb_entity()
+        #    print("beaker_config: ", beaker_config)
+        #    experiment_config.update(vars(beaker_config))
         accelerator.init_trackers(
             "open_instruct_internal",
             experiment_config,
@@ -936,7 +942,7 @@ def main(args: FlatArguments):
             starting_epoch = resume_step // len(train_dataloader)
             completed_steps = resume_step // args.gradient_accumulation_steps
             resume_step -= starting_epoch * len(train_dataloader)
-
+    print("Model type is unsloth: ", type(model))
     print(f"Starting from epoch {starting_epoch} and step {completed_steps}.")
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
@@ -984,8 +990,8 @@ def main(args: FlatArguments):
                         loss += aux_loss
                 # We keep track of the loss at each logged step
                 total_loss += loss.detach().float()
-                with torch.cuda.amp.autocast(dtype = torch.float16):
-                    accelerator.backward(loss)
+                #with torch.cuda.amp.autocast(dtype = torch.float16):
+                accelerator.backward(loss)
                 if args.load_balancing_loss:
                     total_aux_loss += aux_loss.detach().float()
                 # clip gradient norm. don't do this with deepspeed
@@ -1127,14 +1133,19 @@ def main(args: FlatArguments):
             print(f"Submit jobs after model training is finished - Stdout:\n{stdout.decode()}")
             print(f"Submit jobs after model training is finished - Stderr:\n{stderr.decode()}")
             print(f"Submit jobs after model training is finished - process return code: {process.returncode}")
-
-    if args.push_to_hub:
-        push_folder_to_hub(
-            accelerator,
-            args.output_dir,
-            args.hf_repo_id,
-            args.hf_repo_revision,
-        )
+    if use_unsloth:
+        model.save_pretrained("unsloth_tinny_llama_tldr") # Local saving
+        tokenizer.save_pretrained("unsloth_tinny_llama_tldr")
+        model.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "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") # Online saving
+        tokenizer.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "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") # Online saving
+    else: 
+        if args.push_to_hub:
+            push_folder_to_hub(
+                accelerator,
+                args.output_dir,
+                args.hf_repo_id,
+                args.hf_repo_revision,
+            )
     accelerator.wait_for_everyone()
     if args.with_tracking:
         accelerator.end_training()

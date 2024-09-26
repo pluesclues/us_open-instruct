@@ -28,8 +28,6 @@ accelerate launch \
     --mixed_precision bf16 \
     --num_machines 1 \
     --num_processes $NUM_GPUS \
-    --use_deepspeed \
-    --deepspeed_config_file configs/ds_configs/stage3_no_offloading_accelerate.conf \
     open_instruct/finetune.py \
     "$2" #\
     #--report_to=tensorboard,wandb
