@@ -593,7 +593,6 @@ def main(args: FlatArguments):
             max_seq_length = max_seq_length,
             dtype = dtype,
             load_in_4bit = load_in_4bit,
-            token = "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"
             #low_cpu_mem_usage=False,
             #device_map = None
             )
@@ -1136,8 +1135,8 @@ def main(args: FlatArguments):
     if use_unsloth:
         model.save_pretrained("unsloth_tinny_llama_tldr") # Local saving
         tokenizer.save_pretrained("unsloth_tinny_llama_tldr")
-        model.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "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") # Online saving
-        tokenizer.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "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") # Online saving
+        model.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "") # Online saving
+        tokenizer.push_to_hub("keithdrexel/unsloth_tinny_llama_tldr", token = "") # Online saving
     else: 
         if args.push_to_hub:
             push_folder_to_hub(
