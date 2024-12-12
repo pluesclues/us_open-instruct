@@ -4,7 +4,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from typing import Literal, Optional
-
+from queue import Empty
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +28,7 @@ from transformers import (
     get_scheduler,
 )
 import sys
-sys.path.append("/home/kt828/us_open-instruct/") 
+sys.path.append("/home/kt828/unsloth_open-instruct/") 
 
 from open_instruct.dataset_processor import (
     CHAT_TEMPLATES,
@@ -53,13 +53,14 @@ from open_instruct.model_utils import (
     truncate_response,
     unwrap_model_for_generation,
 )
-from open_instruct.online_eval import evaluate
+#from open_instruct.online_eval import evaluate
 from open_instruct.utils import (
     ArgumentParserPlus,
     get_wandb_tags,
     maybe_use_ai2_wandb_entity,
 )
 import bitsandbytes as bnb
+from lib2to3.refactor import RefactoringTool
 from unsloth import FastLanguageModel
 
 api = HfApi()
@@ -167,7 +168,8 @@ class Args:
     """the reward value for responses that do not contain `stop_token_id`"""
     non_stop_penalty: bool = False
     """whether to penalize responses that do not contain `stop_token_id`"""
-
+    cache_implementation: str = 'quantized'
+    """Implements how KV caching is done"""
     # online DPO specific args
     beta: float = 0.05
     """the beta value of the RLHF objective (KL coefficient)"""
@@ -197,6 +199,7 @@ def calculate_runtime_args_and_accelerator(args: Args, model_config: ModelConfig
         args.local_batch_size, args.num_mini_batches, "`local_batch_size` must be a multiple of `num_mini_batches`"
     )
     args.num_training_steps = args.total_episodes // args.batch_size
+    #breakpoint()
     args.eval_freq = max(1, args.num_training_steps // args.num_evals)
     # DPO logic: repeats the same prompt `num_generation_per_prompt` times
     args.local_dataloader_batch_size = exact_div(
@@ -250,12 +253,14 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     torch.backends.cudnn.deterministic = True
 
     #Create the models
-    max_seq_length = 4096 # Choose any! We auto support RoPE Scaling internally!
-    dtype = torch.float16 # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
-    load_in_4bit = False # Use 4bit quantization to reduce memory usage. Can be False.
+    max_seq_length = 2048 # Choose any! We auto support RoPE Scaling internally!
+    dtype = None # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
+    load_in_4bit = True # Use 4bit quantization to reduce memory usage. Can be False.
+
 
     #creating unsloth FastLanguageModel and turning them into peft models
-    policy, _ = FastLanguageModel.from_pretrained(
+    #print("name of model: ", model_config.model_name_or_path)
+    model, _ = FastLanguageModel.from_pretrained(
       model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
       max_seq_length = max_seq_length,
       dtype = dtype,
@@ -263,13 +268,13 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
       #token  = "" 
     )
 
-    policy = FastLanguageModel.get_peft_model(
-        policy,
+    model = FastLanguageModel.get_peft_model(
+        model,
         r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj",],
+                        "gate_proj", "up_proj", "down_proj",],
         lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+        lora_dropout = 1e-7, # Supports any, but = 0 is optimized 1e-7
         bias = "none",    # Supports any, but = "none" is optimized
         # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
         use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
@@ -277,8 +282,9 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         use_rslora = False,  # We support rank stabilized LoRA
         loftq_config = None, # And LoftQ
     )
+    #breakpoint()
 
-    ref_policy, tokenizer = FastLanguageModel.from_pretrained(
+    ref_model, tokenizer = FastLanguageModel.from_pretrained(
       model_name =  model_config.model_name_or_path, # "unsloth/tinyllama" for 16bit loading
       max_seq_length = max_seq_length,
       dtype = dtype,
@@ -286,14 +292,15 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
       #token = "" 
 
     )
+    #print("ref polciy type: ", type(ref_model))
 
     ref_model = FastLanguageModel.get_peft_model(
-        ref_policy,
+        ref_model,
         r = 16, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                          "gate_proj", "up_proj", "down_proj",],
+                        "gate_proj", "up_proj", "down_proj",],
         lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized
+        lora_dropout = 1e-7, # Supports any, but = 0 is optimized 1e-7
         bias = "none",    # Supports any, but = "none" is optimized
         # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
         use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
@@ -301,23 +308,38 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         use_rslora = False,  # We support rank stabilized LoRA
         loftq_config = None, # And LoftQ
     )
+    breakpoint()
 
+    #breakpoint()
+    #print("ref polciy type: ", type(ref_model))
+
+    #print("Models Loaded")
+    tokenizer.padding_side="right"
     # create a tokenizer (pad from right)
-    tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, padding_side="right")
+    #tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, padding_side="right")
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})  # NOTE: we do not resize the embedding
     tokenizer.chat_template = CHAT_TEMPLATES[dataset_config.chat_template]
+    # Load the dataset
 
-    # create the dataset
-    dataset = load_dataset("trl-internal-testing/sentiment-trl-style")
+    # Take only the first 10,000 samples for each split
+    # Load the dataset
+    dataset = load_dataset("trl-internal-testing/tldr-preference-sft-trl-style")
+
+    dataset["train"] = dataset["train"].select(range(8000))  # Limit to 8,000 samples
+    dataset["test"] = dataset["test"].select(range(2000))    # Limit to 2,000 samples
+
+
+    # Continue with the dataset processing
     dataset_processor = SFTDatasetProcessor(tokenizer=tokenizer, config=dataset_config)
     dataset_processor.sanity_check_(dataset)
     with accelerator.main_process_first():
         dataset = dataset_processor.tokenize(dataset)
         dataset = dataset_processor.filter(dataset)
+
     train_dataset = dataset[dataset_config.dataset_train_split]
     eval_dataset = dataset[dataset_config.dataset_eval_split]
-
     # some more runtime logging
+
     if accelerator.is_main_process:
         pprint([args, dataset_config, model_config])
         visualize_token(train_dataset[0][INPUT_IDS_PROMPT_KEY], tokenizer)
@@ -327,16 +349,18 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 dataset, save_path=f"runs/{args.run_name}/token_length.png"
             )
             wandb.log({"token_length": wandb.Image(f"runs/{args.run_name}/token_length.png")})
-
+    FastLanguageModel.reset_functions()
     # create the reward model and optimizer
     reward_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
-        args.reward_model_path,
+        "keithdrexel/reward_modeling__meta-llama_Llama-3.2-1B",
+        revision = "reward_modeling__1__1728309120", 
         num_labels=1,
         torch_dtype=torch.bfloat16,
-        #attn_implementation="flash_attention_2",
+        attn_implementation="flash_attention_2",
         use_cache=False,
     )
-    model = policy
+    FastLanguageModel.set_functions()
+    print("reward model type: ", type(reward_model))
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     for module in [model, ref_model, reward_model]:
@@ -346,7 +370,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             args.stop_token_id = tokenizer.eos_token_id
         if args.stop_token == "period":
             args.stop_token_id = tokenizer.encode(".")[0]
-    optimizer = bnb.optim.Adam(policy.parameters(), lr=args.learning_rate, betas=(0.9, 0.995), optim_bits=8, percentile_clipping=5,eps=args.eps)
+    optimizer = bnb.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.995), optim_bits=8, percentile_clipping=5,eps=args.eps)
     scheduler = get_scheduler(
         args.lr_scheduler_type,
         optimizer=optimizer,
@@ -368,7 +392,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         collate_fn=data_collator,
         drop_last=True,  # needed; otherwise the last batch will be of ragged shape
     )
-
+    #breakpoint()
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
@@ -391,16 +415,21 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         while True:
             yield from dataloader
 
+    #512
+    # top_k=0.0,
+    # top_p=1.0,
     iter_dataloader = iter(repeat_generator())
     generation_config = GenerationConfig(
-        max_new_tokens=args.response_length,
-        min_new_tokens=args.response_length,
-        temperature=(args.temperature + 1e-7),
+        #max_length = 309,
+        max_new_tokens = 53,
+        min_new_tokens= 53,
+        temperature=(0 + 1e-7),
+        do_sample=True,
         top_k=0.0,
         top_p=1.0,
-        do_sample=True,
-        # eos_token_id=args.stop_token_id,
+        eos_token_id=args.stop_token_id,
         pad_token_id=tokenizer.pad_token_id,
+
     )
 
     # set up the metrics and initial states
@@ -416,6 +445,8 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     # training loop
     start_time = time.time()
     for training_step in range(1, args.num_training_steps + 1):
+        if training_step%100 == 0:
+            model.push_to_hub_merged("keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-dpo", tokenizer, save_method = "merged_16bit", token = "")
         episode += 1 * args.batch_size
         scheduler.step()
         data = next(iter_dataloader)
@@ -451,16 +482,18 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             ref_logprobs = []
             scores = []
             sequence_lengths = []
-            with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
-                query_responses, logitss = unsloth_batch_generation(
+            #confirm padding is right 
+            FastLanguageModel.for_training(model)
+            FastLanguageModel.for_training(ref_model)
+            with unwrap_model_for_generation(model, accelerator, is_peft_model = False) as unwrapped_model:
+                query_responses = unsloth_batch_generation(
                     unwrapped_model,
                     queries,
                     args.local_rollout_forward_batch_size,
                     tokenizer.pad_token_id,
                     generation_config,
                 )
-            FastLanguageModel.for_training(model)
-            FastLanguageModel.for_training(ref_policy)
+
             training_time_start = time.time()
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
@@ -469,7 +502,6 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 #logits = logitss[i : i + args.local_rollout_forward_batch_size]
                 model_output = forward(model, query_response, tokenizer.pad_token_id)
                 logits = model_output.logits[:, context_length - 1 : -1]
-                logitss[i : i + args.local_rollout_forward_batch_size] = logits
                 logits /= args.temperature + 1e-7
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
@@ -488,6 +520,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 postprocessed_response = response
                 if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
                     postprocessed_response = truncate_response(args.stop_token_id, tokenizer.pad_token_id, response)
+                #breakpoint() 
 
                 # Response Processing 2. run reward model on the truncated responses
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
@@ -498,7 +531,6 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 _, score, _ = get_reward(
                     reward_model, postprocessed_query_response, tokenizer.pad_token_id, context_length
                 )
-
                 responses.append(response)
                 postprocessed_responses.append(postprocessed_response)
                 logprobs.append(logprob)
@@ -518,6 +550,8 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
+            #print("Postprocessed_response: ", postprocessed_response)
+            #print("postprocessed_responses == args.stop_token_id: ", postprocessed_responses == args.stop_token_id)
             contain_stop_token = torch.any(postprocessed_responses == args.stop_token_id, dim=-1)
             # NOTE: only apply the stop token filter if the response is long enough
             # otherwise the model could learn to generate the first token as the stop token
@@ -623,7 +657,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                         else:
                             raise NotImplementedError(f"invalid loss type {args.loss_type}")
                         
-                        with torch.cuda.amp.autocast(dtype = torch.float16):
+                        with torch.cuda.amp.autocast(dtype = torch.bfloat16):
                             loss = losses.mean()
                             accelerator.backward(loss)
                         optimizer.step()
@@ -679,10 +713,88 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 "logps/chosen": accelerator.gather(chosen_logprobs_stats).mean().item(),
                 "logps/rejected": accelerator.gather(rejected_logprobs_stats).mean().item(),
             }
-            if accelerator.is_main_process:
-                print_rich_single_line_metrics(metrics)
-                for key, value in metrics.items():
-                    writer.add_scalar(key, value, episode)
+        from collections import defaultdict
+
+        import csv
+        # Define the file path for logging
+
+        # Define the file path for logging
+        log_file = "sample_prompts_completions_log.csv"
+
+        # Initialize the log file with headers if it doesn't already exist
+        if not os.path.isfile(log_file):
+            with open(log_file, mode="w", newline="") as file:
+                csv_writer = csv.writer(file)
+                csv_writer.writerow(["episode", "prompt", "model_response", 'score'])
+        # Initialize the table dictionary for storing results
+        table = defaultdict(list)
+        if accelerator.is_main_process:
+            print_rich_single_line_metrics(metrics)
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, episode)
+                # Use unwrap_model_for_generation to work with the unwrapped model
+            with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
+                # Limit the loop to 25 batches
+                #print("Generating")
+                for i, batch in enumerate(eval_dataloader):
+                    if i >= 25:
+                        break  # Stop after processing 25 examples
+                    #print("data loader is empty")
+                    # Extract queries from the batch
+                    queries = batch["input_ids_prompt"]
+                    context_length = queries.shape[1]
+
+                    # Perform generation with unsloth_batch_generation
+                    with torch.no_grad():
+                        query_responses = unsloth_batch_generation(
+                            unwrapped_model,
+                            queries,
+                            args.local_rollout_forward_batch_size,
+                            tokenizer.pad_token_id,
+                            generation_config,
+                        )
+
+                        # Extract only the generated response (exclude the prompt part)
+                        responses = query_responses[:, context_length:]
+
+                        # Post-process responses
+                        postprocessed_responses = responses
+                        if args.stop_token_id is not None:  # Handle stop token if specified
+                            postprocessed_responses = truncate_response(
+                                args.stop_token_id, tokenizer.pad_token_id, responses
+                            )
+
+                        # Decode and gather queries and model responses
+                        table["query"].extend(
+                            gather_object(tokenizer.batch_decode(queries, skip_special_tokens=True))
+                        )
+                        table["model_response"].extend(
+                            gather_object(tokenizer.batch_decode(postprocessed_responses))
+                        )
+
+                        # Concatenate prompt and response for reward scoring
+                        postprocessed_query_response = torch.cat((queries, postprocessed_responses), 1)
+                        _, scores, _ = get_reward(
+                            reward_model, postprocessed_query_response, tokenizer.pad_token_id, context_length
+                        )
+                        table["score"].extend(accelerator.gather(scores).float().cpu().numpy())
+                        # Append the first entry of each episode to the CSV file
+                        with open(log_file, mode="a", newline="") as file:
+                            csv_writer = csv.writer(file)
+                            csv_writer.writerow([episode,  table["query"][0], table["model_response"][0], table["score"][0]])
+                # Convert the table dictionary to a DataFrame
+                df = pd.DataFrame(table)
+                print("gets and logs dataframe")
+                wandb.log({"sample_completions": wandb.Table(dataframe=df)})
+
+                # if args.with_tracking:
+                #     wandb.log({"sample_completions": wandb.Table(dataframe=df)})
+                #     breakpoint()
+                # else:
+                #     print_rich_table(df)
+                del table
+
+
         del (queries, responses, postprocessed_responses, logprobs, ref_logprobs, sequence_lengths, scores)
         del (metrics, kl, non_score_reward, rlhf_reward)
         del (g_chosen_reward, g_rejected_reward)
@@ -692,17 +804,9 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     # save model
     os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
     original_tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path)
-    save_with_accelerate(
-        accelerator,
-        model,
-        original_tokenizer,
-        args.output_dir,
-        False,
-        args.push_to_hub,
-        args.hf_repo_id,
-        args.hf_repo_revision,
-    )
-
+    use_unsloth= True
+    if use_unsloth:
+        model.push_to_hub_merged("keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-dpo", tokenizer, save_method = "merged_16bit", token = "")
 
 if __name__ == "__main__":
 
