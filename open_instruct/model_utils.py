@@ -20,6 +20,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple, Union
 
+from networkx import generate_edgelist
+import transformers.models
+
 try:
     import deepspeed
     from deepspeed.runtime.engine import DeepSpeedEngine
@@ -40,6 +43,19 @@ from transformers import PreTrainedModel, PreTrainedTokenizer
 
 from open_instruct.utils import retry_on_exception
 
+from unsloth import FastLanguageModel 
+from torch.nn import functional as F
+
+
+# from unsloth import(
+#     original_llama_attention_forward,
+#     original_llama_sdpa_attention_forward,
+#     original_llama_flash_attention2_forward,
+#     original_llama_decoder_layer_forward,
+#     original_llama_model_forward,
+#     original_llama_for_causal_lm_forward,
+#     original_peft_model_for_causal_lm_forward
+# )
 
 @dataclass
 class ModelConfig:
@@ -166,13 +182,19 @@ def get_reward(
     # Calculate position IDs for each token, considering the cumulative sum of the attention mask (to exclude padding)
     # Shape: (batch_size, sequence_length)
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-
+    #print("model type: ", type(model))
     # Access the LM backbone from the reward model using its base model prefix
+    FastLanguageModel.reset_functions()
     lm_backbone = getattr(model, model.base_model_prefix)
 
+
+    #print("Model.base_model_prefix: ", model.base_model_prefix)
+    #print("lm backbone type: ", type(lm_backbone))
     # Replace padding tokens with zeros in the input IDs (so padding tokens won't affect the model's processing)
     # Shape: (batch_size, sequence_length)
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    #lm_backbone.forward = transformers.models.llama.modeling_llama.LlamaModel.reward_forward
+    #print("lm backbone forward: ", lm_backbone.forward)
     output = lm_backbone(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -181,6 +203,7 @@ def get_reward(
         output_hidden_states=True,
         use_cache=False,  # otherwise mistral-based RM would error out
     )
+
     reward_logits = model.score(output.hidden_states[-1])  # (batch_size, sequence_length)
 
     # Calculate the length of each sequence by finding the first occurrence of a padding token after the context
@@ -190,6 +213,7 @@ def get_reward(
         reward_logits.shape[-1] == 1
     ), "Reward model should output a single scalar per token. Check if you added `num_labels=1` when doing `AutoModelForSequenceClassification.from_pretrained(...)`."
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+    FastLanguageModel.set_functions()
 
     # Return the reward logits for all tokens, the final reward scores for each sequence, and the sequence lengths
     return (
@@ -278,6 +302,8 @@ def generate(
             - `logits` (`torch.Tensor`):
                 The logits output from the generation process.
     """
+    #generation_config['cache_implementation'] = 'quantized'
+    #print("generation cache implementation: ", generation_config['cache_implementation'] )
     context_length = queries.shape[1]
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
@@ -290,7 +316,9 @@ def generate(
         return_dict_in_generate=True,
         output_logits=True,
     )
+    breakpoint()
     logits = torch.stack(output.logits, 1)
+    breakpoint()
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
 
 
@@ -314,6 +342,8 @@ def batch_generation(
         )
         query_responses.append(query_response)
         logitss.append(logits)
+    #breakpoint()
+    #Bx53xA
     return torch.cat(query_responses, 0), torch.cat(logitss, 0)
 
 def batch_generation_vllm(
@@ -355,6 +385,66 @@ def batch_generation_vllm(
         * queries.shape[0]
     ]
 
+@torch.no_grad()
+def unsloth_generate(
+    lm_backbone: torch.nn.Module, queries: torch.Tensor, pad_token_id: int, generation_config: dict, top_k
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generates sequences from the language model backbone in a way that does not affect padding tokens.
+    Args:
+        lm_backbone (`torch.nn.Module`):
+            The language model backbone used for generation.
+        queries (`torch.Tensor`):
+            The tensor containing the input queries.
+        pad_token_id (`int`):
+            The token ID representing the pad token.
+        generation_config (`dict`):
+            The configuration dictionary for generation settings.
+    Returns:
+        tuple:
+            - `generated_sequences` (`torch.Tensor`):
+                The concatenated tensor of input queries and generated sequences.
+            - `logits` (`torch.Tensor`):
+                The logits output from the generation process.
+    """
+    #generation_config['cache_implementation'] = 'quantized'
+    #print("generation cache implementation: ", generation_config['cache_implementation'] )
+    #breakpoint()
+    context_length = queries.shape[1]
+    attention_mask = queries != pad_token_id
+    #input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    idx_cond = queries
+    #i = 0 
+    for _ in range(generation_config.min_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            #breakpoint()
+            idx_cond = idx_cond if queries.size(1) <= context_length else idx_cond[:, -context_length:]
+
+            # forward the model to get the logits for the index in the sequence
+            logits = forward(lm_backbone, idx_cond,pad_token_id).logits
+            #breakpoint()
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / generation_config.temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, generation_config.top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # either sample from the distribution or take the most likely element
+            if generation_config.do_sample:
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = torch.topk(probs, k=1, dim=-1)
+            # append sampled index to the running sequence and continue
+            idx_cond = torch.cat((idx_cond, idx_next), dim=1)
+            #print("i: ", i)
+            #i+=1
+    #breakpoint()
+
+    return idx_cond
+
+
 
 @torch.no_grad()
 def unsloth_batch_generation(
@@ -370,16 +460,17 @@ def unsloth_batch_generation(
     FastLanguageModel.for_inference(model)
     for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
         query = queries[i : i + local_rollout_forward_batch_size]
-        query_response, logits = generate(
+        query_response = unsloth_generate(
             model,
             query,
             pad_token_id,
             generation_config,
+            top_k=None
         )
         query_responses.append(query_response)
-        logitss.append(logits)
     FastLanguageModel.for_training(model)
-    return torch.cat(query_responses, 0), torch.cat(logitss, 0)
+    #breakpoint()
+    return torch.cat(query_responses, 0)
 
 def save_with_accelerate(
     accelerator: Accelerator,
@@ -509,6 +600,7 @@ def unwrap_model_for_generation(
     """
     unwrapped_model = accelerator.unwrap_model(model)
     if is_peft_model:
+        breakpoint()
         unwrapped_model.pretrained_model.disable_adapter()
     if accelerator.state.deepspeed_plugin is not None and accelerator.state.deepspeed_plugin.zero_stage == 3:
         with deepspeed.zero.GatheredParameters(model.parameters()):
