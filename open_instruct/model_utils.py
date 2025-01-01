@@ -444,6 +444,30 @@ def unsloth_generate(
 
     return idx_cond
 
+@torch.no_grad()
+def unsloth_generate_text(model, queries, tokenizer, pad_token_id, generation_config):
+    # Extract the maximum length for generation
+    max_length = generation_config.max_length
+
+    # Get the context length from the input queries
+    context_length = queries.shape[1]
+
+    # Mask the input and prepare it for the model
+    attention_mask = queries != pad_token_id
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    # Generate output sequences
+    outputs = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=53,  
+        use_cache=True,
+        do_sample=True,
+        top_k=0,
+        top_p=1.0,
+        temperature=0.7,
+    )
+
+    return outputs
 
 
 @torch.no_grad()
@@ -451,6 +475,7 @@ def unsloth_batch_generation(
     model: torch.nn.Module,
     queries: torch.Tensor,
     local_rollout_forward_batch_size: int,
+    tokenizer,
     pad_token_id: int,
     generation_config: dict,
 ):
@@ -460,16 +485,22 @@ def unsloth_batch_generation(
     FastLanguageModel.for_inference(model)
     for i in range(0, queries.shape[0], local_rollout_forward_batch_size):
         query = queries[i : i + local_rollout_forward_batch_size]
-        query_response = unsloth_generate(
+        query_response = unsloth_generate_text(
             model,
             query,
+            tokenizer,
             pad_token_id,
             generation_config,
-            top_k=None
         )
         query_responses.append(query_response)
     FastLanguageModel.for_training(model)
-    #breakpoint()
+    for i in range(len(query_responses)):
+
+        if query_responses[i].shape[1] - query.shape[1] != 53:
+            pad_tensor = torch.full((query_responses[i].shape[0],53 - (query_responses[i].shape[1] - query.shape[1])), tokenizer.eos_token_id, dtype=torch.int64).to("cuda:0")
+
+            query_responses[i] = torch.cat((query_responses[i], pad_tensor), dim=1)
+
     return torch.cat(query_responses, 0)
 
 def save_with_accelerate(
@@ -600,8 +631,8 @@ def unwrap_model_for_generation(
     """
     unwrapped_model = accelerator.unwrap_model(model)
     if is_peft_model:
-        breakpoint()
-        unwrapped_model.pretrained_model.disable_adapter()
+        #breakpoint()
+        unwrapped_model.disable_adapter()
     if accelerator.state.deepspeed_plugin is not None and accelerator.state.deepspeed_plugin.zero_stage == 3:
         with deepspeed.zero.GatheredParameters(model.parameters()):
             remove_hooks(model)
