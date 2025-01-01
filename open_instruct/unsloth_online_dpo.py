@@ -274,7 +274,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj",],
         lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized 1e-7
+        lora_dropout = 0, # Supports any, but = 0 is optimized 1e-7
         bias = "none",    # Supports any, but = "none" is optimized
         # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
         use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
@@ -300,7 +300,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj",],
         lora_alpha = 16,
-        lora_dropout = 1e-7, # Supports any, but = 0 is optimized 1e-7
+        lora_dropout =0, # Supports any, but = 0 is optimized 1e-7
         bias = "none",    # Supports any, but = "none" is optimized
         # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
         use_gradient_checkpointing = "unsloth", # True or "unsloth" for very long context
@@ -308,12 +308,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         use_rslora = False,  # We support rank stabilized LoRA
         loftq_config = None, # And LoftQ
     )
-    breakpoint()
 
-    #breakpoint()
-    #print("ref polciy type: ", type(ref_model))
-
-    #print("Models Loaded")
     tokenizer.padding_side="right"
     # create a tokenizer (pad from right)
     #tokenizer = AutoTokenizer.from_pretrained(model_config.model_name_or_path, padding_side="right")
@@ -360,7 +355,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         use_cache=False,
     )
     FastLanguageModel.set_functions()
-    print("reward model type: ", type(reward_model))
+
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
     for module in [model, ref_model, reward_model]:
@@ -415,9 +410,6 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
         while True:
             yield from dataloader
 
-    #512
-    # top_k=0.0,
-    # top_p=1.0,
     iter_dataloader = iter(repeat_generator())
     generation_config = GenerationConfig(
         #max_length = 309,
@@ -445,32 +437,11 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
     # training loop
     start_time = time.time()
     for training_step in range(1, args.num_training_steps + 1):
-        if training_step%100 == 0:
-            model.push_to_hub_merged("keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-dpo", tokenizer, save_method = "merged_16bit", token = "")
+        if training_step > 0 and training_step%100 == 0:
+            model.push_to_hub_merged("keithdrexel/unsloth-llama-3.2-1b-tldr-unsloth-dpo_mid_checkpoint_3", tokenizer, save_method = "merged_16bit", token = "")
         episode += 1 * args.batch_size
         scheduler.step()
         data = next(iter_dataloader)
-
-        # # (optionally) evaluate the model
-        # if args.num_evals > 0 and (training_step - 1) % args.eval_freq == 0:
-        #     table = evaluate(
-        #         model,
-        #         reward_model,
-        #         accelerator,
-        #         args.stop_token_id,
-        #         eval_dataloader,
-        #         tokenizer,
-        #         args.response_length,
-        #     )
-        #     for key in table:
-        #         table[key] = gather_object(table[key])
-        #     df = pd.DataFrame(table)
-        #     if accelerator.is_main_process:
-        #         if args.with_tracking:
-        #             wandb.log({"sample_completions": wandb.Table(dataframe=df)})
-        #         else:
-        #             print_rich_table(df)
-        #     del table, df
 
         with torch.no_grad():
             queries = data[INPUT_IDS_PROMPT_KEY].to(device)
@@ -482,18 +453,18 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             ref_logprobs = []
             scores = []
             sequence_lengths = []
-            #confirm padding is right 
             FastLanguageModel.for_training(model)
             FastLanguageModel.for_training(ref_model)
-            with unwrap_model_for_generation(model, accelerator, is_peft_model = False) as unwrapped_model:
+
+            with unwrap_model_for_generation(model, accelerator, is_peft_model = True) as unwrapped_model:
                 query_responses = unsloth_batch_generation(
-                    unwrapped_model,
+                    model,
                     queries,
                     args.local_rollout_forward_batch_size,
+                    tokenizer,
                     tokenizer.pad_token_id,
                     generation_config,
                 )
-
             training_time_start = time.time()
             for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                 query = queries[i : i + args.local_rollout_forward_batch_size]
@@ -505,6 +476,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 logits /= args.temperature + 1e-7
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                #breakpoint()
                 del logits, all_logprob
                 torch.cuda.empty_cache()
 
@@ -520,12 +492,10 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 postprocessed_response = response
                 if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
                     postprocessed_response = truncate_response(args.stop_token_id, tokenizer.pad_token_id, response)
-                #breakpoint() 
 
                 # Response Processing 2. run reward model on the truncated responses
                 postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
 
-                #print("postprocessed_query_response: ", tokenizer.decode(postprocessed_query_response))
                 
                 sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
                 _, score, _ = get_reward(
@@ -547,11 +517,6 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             gc.collect()
             torch.cuda.empty_cache()
 
-            # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
-            # responses not passing that filter will receive a low (fixed) score
-            # only query humans on responses that pass that filter
-            #print("Postprocessed_response: ", postprocessed_response)
-            #print("postprocessed_responses == args.stop_token_id: ", postprocessed_responses == args.stop_token_id)
             contain_stop_token = torch.any(postprocessed_responses == args.stop_token_id, dim=-1)
             # NOTE: only apply the stop token filter if the response is long enough
             # otherwise the model could learn to generate the first token as the stop token
@@ -657,9 +622,9 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                         else:
                             raise NotImplementedError(f"invalid loss type {args.loss_type}")
                         
-                        with torch.cuda.amp.autocast(dtype = torch.bfloat16):
-                            loss = losses.mean()
-                            accelerator.backward(loss)
+                        #with torch.cuda.amp.autocast(dtype = torch.bfloat16):
+                        loss = losses.mean()
+                        accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
                         with torch.no_grad():
@@ -684,7 +649,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                 del (
                     loss, logits, concat_output, concat_query_responses,
                     chosen_logits, rejected_logits, chosen_logprobs, rejected_logprobs,
-                    chosen_responses, rejected_responses,
+                    chosen_responses, rejected_responses
                 )
                 # fmt: on
                 # del everything and empty cache
@@ -733,7 +698,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
             for key, value in metrics.items():
                 writer.add_scalar(key, value, episode)
                 # Use unwrap_model_for_generation to work with the unwrapped model
-            with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
+            with unwrap_model_for_generation(model, accelerator, is_peft_model = True) as unwrapped_model:
                 # Limit the loop to 25 batches
                 #print("Generating")
                 for i, batch in enumerate(eval_dataloader):
@@ -750,6 +715,7 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
                             unwrapped_model,
                             queries,
                             args.local_rollout_forward_batch_size,
+                            tokenizer,
                             tokenizer.pad_token_id,
                             generation_config,
                         )
@@ -810,13 +776,6 @@ def main(args: Args, dataset_config: DatasetConfig, model_config: ModelConfig):
 
 if __name__ == "__main__":
 
-    # print("Before deletion:")
-    # print("Args, ", dir(Args))  # List all attributes
-    # if hasattr(Args, 'gradient_checkpointing'):
-    #     print("Deleting Args.gradient_checkpointing")
-    #     del Args.gradient_checkpointing
-    # print("After deletion:")
-    # print("Args, ", dir(Args))  # Check if it was deleted
     ModelConfig.gradient_checkpointing = True
     parser = ArgumentParserPlus((Args, DatasetConfig, ModelConfig))
 
